@@ -1,0 +1,4919 @@
+"""
+Activity Monitor  v7.0
+======================
+All output lives in one folder:  ~/activity_monitor/
+  activity.db     – SQLite WAL database
+  dashboard.html  – SPA shell (written once)
+  data.json       – live payload, refreshed every INTERVAL_SEC
+  exports/        – timestamped CSV & JSON snapshots
+  monitor.log     – rotating log  (2 × 2 MB)
+
+Dashboard is a no-reload SPA: a JS poller fetches data.json and
+patches only the changed DOM nodes — no flicker, no scroll reset.
+
+Tabs: Overview · CPU · RAM · GPU · Network · Disk · Processes · Info
+
+Cross-platform: every metric is optional.  Missing hardware, drivers,
+or Python packages produce empty/hidden elements instead of crashes.
+Tested on Linux, macOS, and Windows.  Python 3.8+ required.
+"""
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 1 — STANDARD LIBRARY IMPORTS
+# ══════════════════════════════════════════════════════════════════════════════
+import csv
+import datetime as dt
+import hashlib
+import json
+import logging
+import os
+import platform
+import queue
+import signal
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import textwrap
+import threading
+import time
+import traceback
+from dataclasses import dataclass, field
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple, Union
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 2 — PYTHON VERSION GUARD
+# ══════════════════════════════════════════════════════════════════════════════
+if sys.version_info < (3, 8):
+    sys.exit(
+        f"Activity Monitor requires Python 3.8 or newer.\n"
+        f"You are running Python {sys.version.split()[0]}.\n"
+        f"Upgrade with: https://www.python.org/downloads/"
+    )
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 3 -- FILE SYSTEM  (directory layout, atomic writes, health tracking)
+#
+#  Folder structure
+#  ================
+#  ~/activity_monitor/
+#    data/
+#      logs/         rotating log files        (2 MB × 3 = 6 MB max)
+#      snapshots/    gzip JSON ring             (configurable count)
+#      cache/        ephemeral runtime files    (data.json, dashboard.html)
+#      exports/      on-demand CSV + JSON
+#    activity.db     SQLite WAL database
+#    config.json     user-editable configuration
+#
+#  Crash safety
+#  ============
+#  Every file write goes through _atomic_write_*:
+#    1. Create a uniquely-named sibling tmp file (PID + monotonic counter)
+#    2. Write all content
+#    3. os.replace() — atomic on POSIX; atomic on Windows since Python 3.3
+#    4. If any step fails, delete the tmp and return False (never raise)
+#  A crash between steps 2 and 3 leaves a stale .tmp file.
+#  _cleanup_stale_tmps() is called at startup to remove them.
+#
+#  Stability
+#  =========
+#  - Every mkdir uses exist_ok=True; each directory is attempted independently
+#  - A write-probe confirms writability before committing to a base dir
+#  - StorageHealth tracks disk space and consecutive failures; callers can
+#    gate writes on is_healthy() to avoid spamming a full disk
+#  - Orphaned .tmp files from previous crashes are cleaned on startup
+# ══════════════════════════════════════════════════════════════════════════════
+
+import gzip          # snapshot compression
+import hashlib       # dedup hashing
+import io as _io     # StringIO for in-memory CSV building
+
+# Monotonic counter for unique tmp-file names (avoids PID collisions on fork)
+_TMP_COUNTER: int = 0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Directory resolution with graceful fallback chain
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _probe_writable(path: Path) -> bool:
+    """
+    Return True only when *path* exists (or can be created) AND is writable.
+    Creates the directory if absent; performs a create+delete probe file.
+    """
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+        probe = path / f".write_probe_{os.getpid()}"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink()
+        return True
+    except OSError:
+        return False
+
+
+def _resolve_base_dir() -> Path:
+    """
+    Return the first writable candidate from the fallback chain:
+      ~/activity_monitor  ->  {tempdir}/activity_monitor  ->  ./activity_monitor
+    If all fail, return cwd() (writes will fail gracefully later).
+    """
+    candidates: List[Path] = [
+        Path.home() / "activity_monitor",
+        Path(tempfile.gettempdir()) / "activity_monitor",
+        Path.cwd() / "activity_monitor",
+    ]
+    for c in candidates:
+        if _probe_writable(c):
+            return c
+    return Path.cwd()   # last resort; individual writes will catch errors
+
+
+BASE_DIR: Path = _resolve_base_dir()
+
+# Sub-directory constants — created by _init_dirs() below
+_DIR_DATA:      Path = BASE_DIR / "data"
+_DIR_LOGS:      Path = _DIR_DATA / "logs"
+_DIR_SNAPSHOTS: Path = _DIR_DATA / "snapshots"
+_DIR_CACHE:     Path = _DIR_DATA / "cache"
+_DIR_EXPORTS:   Path = _DIR_DATA / "exports"
+
+# Tracks which directories are confirmed usable after _init_dirs()
+_DIR_STATUS: Dict[str, bool] = {}
+
+
+def _init_dirs() -> None:
+    """
+    Create the full directory tree.
+    Each directory is attempted independently so one failure doesn't block
+    the rest.  Results are stored in _DIR_STATUS for health checks.
+    """
+    for d in (_DIR_DATA, _DIR_LOGS, _DIR_SNAPSHOTS, _DIR_CACHE, _DIR_EXPORTS):
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+            _DIR_STATUS[str(d)] = True
+        except OSError as exc:
+            _DIR_STATUS[str(d)] = False
+            print(f"[AM] WARNING: cannot create {d}: {exc}", file=sys.stderr)
+
+
+_init_dirs()
+
+
+# Canonical paths used throughout the module
+DB_PATH:        str = str(BASE_DIR / "activity.db")
+HTML_PATH:      str = str(_DIR_CACHE / "dashboard.html")
+JSON_DATA_PATH: str = str(_DIR_CACHE / "data.json")
+EXPORT_DIR:     str = str(_DIR_EXPORTS)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Atomic write helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _tmp_path(dest: Path) -> Path:
+    """
+    Return a unique sibling .tmp path for *dest*.
+    Uses PID + monotonic counter so concurrent writers never collide.
+    """
+    global _TMP_COUNTER
+    _TMP_COUNTER += 1
+    return dest.with_name(f"{dest.name}.{os.getpid()}_{_TMP_COUNTER}.tmp")
+
+
+def _atomic_write_text(dest: Path, content: str, encoding: str = "utf-8") -> bool:
+    """
+    Write text to *dest* atomically via a uniquely-named sibling .tmp file.
+
+    Steps:  write tmp  →  os.replace(tmp, dest)  →  True
+    On any failure:  delete tmp (best-effort)  →  return False (never raise)
+
+    ENOSPC (disk full) is caught explicitly and logged at WARNING level
+    so it stands out from ordinary permission errors.
+    """
+    tmp = _tmp_path(dest)
+    try:
+        tmp.write_text(content, encoding=encoding)
+        os.replace(tmp, dest)
+        return True
+    except OSError as exc:
+        _cleanup_tmp(tmp, exc)
+        return False
+
+
+def _atomic_write_bytes(dest: Path, data: bytes) -> bool:
+    """Binary version of _atomic_write_text.  Same semantics."""
+    tmp = _tmp_path(dest)
+    try:
+        tmp.write_bytes(data)
+        os.replace(tmp, dest)
+        return True
+    except OSError as exc:
+        _cleanup_tmp(tmp, exc)
+        return False
+
+
+def _cleanup_tmp(tmp: Path, exc: OSError) -> None:
+    """Delete a failed tmp file and log the error at the appropriate level."""
+    try:
+        tmp.unlink(missing_ok=True)
+    except OSError:
+        pass
+    # ENOSPC gets a WARNING; everything else is DEBUG
+    is_enospc = getattr(exc, "errno", None) == getattr(__import__("errno"), "ENOSPC", None)
+    try:
+        if is_enospc:
+            log.warning("Disk full writing %s — write skipped.", tmp.parent / tmp.name.split(".")[0])
+        else:
+            log.debug("atomic_write %s: %s", tmp, exc)
+    except NameError:
+        print(f"[AM] write error {tmp}: {exc}", file=sys.stderr)
+
+
+def _cleanup_stale_tmps() -> None:
+    """
+    Remove orphaned .tmp files left by a previous crash.
+    Called once at startup; failures are silently ignored.
+    """
+    for d in (_DIR_CACHE, _DIR_SNAPSHOTS, _DIR_EXPORTS):
+        try:
+            for stale in d.glob("*.tmp"):
+                try:
+                    stale.unlink()
+                except OSError:
+                    pass
+        except OSError:
+            pass
+
+
+_cleanup_stale_tmps()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  StorageHealth  —  disk-space and write-failure tracking
+# ─────────────────────────────────────────────────────────────────────────────
+
+class StorageHealth:
+    """
+    Lightweight storage health monitor.
+
+    Tracks:
+      - Available disk space (sampled every DISK_CHECK_INTERVAL writes)
+      - Consecutive write failures (back off when disk is broken)
+
+    Usage:
+      if storage_health.is_healthy():
+          _atomic_write_text(...)
+    """
+
+    DISK_CHECK_INTERVAL: int   = 50     # check disk space every N writes
+    LOW_SPACE_WARN_MB:   float = 100.0  # warn when < 100 MB free
+    CRIT_SPACE_MB:       float = 10.0   # refuse writes when < 10 MB free
+    MAX_FAILURES:        int   = 5      # mark unhealthy after N consecutive fails
+
+    def __init__(self, watch_path: Path) -> None:
+        self._watch      = watch_path
+        self._writes     = 0
+        self._failures   = 0
+        self._avail_mb   = float("inf")
+        self._last_warn: float = 0.0
+
+    def record_success(self) -> None:
+        self._failures = 0
+        self._writes  += 1
+        if self._writes % self.DISK_CHECK_INTERVAL == 0:
+            self._refresh_space()
+
+    def record_failure(self) -> None:
+        self._failures += 1
+        if self._failures >= self.MAX_FAILURES:
+            try:
+                log.warning(
+                    "StorageHealth: %d consecutive write failures on %s",
+                    self._failures, self._watch,
+                )
+            except NameError:
+                pass
+
+    def is_healthy(self) -> bool:
+        """Return True when writes should proceed."""
+        if self._failures >= self.MAX_FAILURES:
+            return False
+        if self._avail_mb < self.CRIT_SPACE_MB:
+            return False
+        return True
+
+    def available_mb(self) -> float:
+        return self._avail_mb
+
+    def _refresh_space(self) -> None:
+        try:
+            stat = os.statvfs(self._watch) if hasattr(os, "statvfs") else None
+            if stat:
+                self._avail_mb = stat.f_bavail * stat.f_frsize / 1_048_576
+            else:
+                # Windows fallback via shutil
+                import shutil
+                self._avail_mb = shutil.disk_usage(self._watch).free / 1_048_576
+            now = time.time()
+            if self._avail_mb < self.LOW_SPACE_WARN_MB and now - self._last_warn > 60:
+                self._last_warn = now
+                try:
+                    log.warning(
+                        "Low disk space: %.1f MB available on %s",
+                        self._avail_mb, self._watch,
+                    )
+                except NameError:
+                    pass
+        except Exception:
+            pass   # space check is best-effort
+
+
+storage_health = StorageHealth(_DIR_DATA)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  WriteBackCache  —  in-memory dedup + batch before disk flush
+# ─────────────────────────────────────────────────────────────────────────────
+
+class WriteBackCache:
+    """
+    Accumulate pending writes in memory.  Deduplicates by content hash so
+    identical successive payloads never hit the disk.
+
+    API:
+      cache.put(key, payload_bytes)   — stage a write
+      cache.is_dirty(key)             — True if pending != last written
+      cache.flush(key, dest)          — write to disk if dirty
+      cache.flush_all(key_dest_map)   — flush all pending in one call
+    """
+
+    def __init__(self) -> None:
+        self._pending:   Dict[str, bytes] = {}   # key -> bytes not yet written
+        self._committed: Dict[str, str]   = {}   # key -> hash of last write
+
+    def put(self, key: str, payload: bytes) -> None:
+        """Stage *payload* for *key*.  Replaces any previous pending value."""
+        self._pending[key] = payload
+
+    def is_dirty(self, key: str) -> bool:
+        """Return True when *key* has a pending payload that differs from last write."""
+        if key not in self._pending:
+            return False
+        new_hash = hashlib.md5(self._pending[key]).hexdigest()
+        return new_hash != self._committed.get(key, "")
+
+    def flush(self, key: str, dest: Path) -> bool:
+        """
+        Write *key*'s pending payload to *dest* if dirty.
+        Returns True when a write was performed or False when skipped/failed.
+        """
+        if not self.is_dirty(key):
+            return False
+        payload = self._pending.get(key)
+        if payload is None:
+            return False
+        ok = _atomic_write_bytes(dest, payload)
+        if ok:
+            self._committed[key] = hashlib.md5(payload).hexdigest()
+            storage_health.record_success()
+        else:
+            storage_health.record_failure()
+        return ok
+
+    def flush_text(self, key: str, dest: Path, encoding: str = "utf-8") -> bool:
+        """Variant for text payloads stored as bytes."""
+        if not self.is_dirty(key):
+            return False
+        payload = self._pending.get(key)
+        if payload is None:
+            return False
+        try:
+            text = payload.decode(encoding)
+        except (UnicodeDecodeError, AttributeError):
+            text = str(payload)
+        ok = _atomic_write_text(dest, text, encoding)
+        if ok:
+            self._committed[key] = hashlib.md5(payload).hexdigest()
+            storage_health.record_success()
+        else:
+            storage_health.record_failure()
+        return ok
+
+    def discard(self, key: str) -> None:
+        """Remove a pending write without flushing (e.g. after external write)."""
+        self._pending.pop(key, None)
+
+    def pending_keys(self) -> List[str]:
+        return list(self._pending.keys())
+
+
+write_cache = WriteBackCache()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 4 -- LOGGING
+#
+#  Architecture:
+#    - RotatingFileHandler in data/logs/monitor.log
+#      DEBUG+ → file  (2 MB × 3 backups = 6 MB ceiling)
+#    - StreamHandler(stderr) → INFO+ (optional, activated by log_to_console)
+#    - delay=True so the log file is not created until the first message
+#  Thread safety: Python's logging is thread-safe by default.
+#  Disk-full guard: if the file handler raises we fall back to stderr.
+# ══════════════════════════════════════════════════════════════════════════════
+
+_LOG_MAX_BYTES:    int = 2 * 1024 * 1024   # 2 MB per file
+_LOG_BACKUP_COUNT: int = 3                 # monitor.log + 3 backups = 4 files
+_LOG_PATH: Path = _DIR_LOGS / "monitor.log"
+
+# Log format includes level-padded to 8 chars for easy grep
+_LOG_FMT   = "[%(asctime)s] %(levelname)-8s %(message)s"
+_LOG_DFMT  = "%Y-%m-%d %H:%M:%S"
+
+
+def _build_logger() -> logging.Logger:
+    logger = logging.getLogger("AM")
+    logger.setLevel(logging.DEBUG)
+    fmt = logging.Formatter(_LOG_FMT, datefmt=_LOG_DFMT)
+
+    # Rotating file handler — defer file creation with delay=True
+    try:
+        fh = RotatingFileHandler(
+            _LOG_PATH,
+            maxBytes=_LOG_MAX_BYTES,
+            backupCount=_LOG_BACKUP_COUNT,
+            encoding="utf-8",
+            delay=True,   # don't create the file until first log call
+        )
+        fh.setLevel(logging.DEBUG)
+        fh.setFormatter(fmt)
+        logger.addHandler(fh)
+    except OSError as exc:
+        sh = logging.StreamHandler(sys.stderr)
+        sh.setFormatter(fmt)
+        logger.addHandler(sh)
+        logger.warning("Log file not writable (%s) — stderr only.", exc)
+
+    return logger
+
+
+log: logging.Logger = _build_logger()
+
+
+def _die(msg: str) -> None:
+    """Log a critical error and exit immediately."""
+    log.critical(msg)
+    sys.exit(1)
+
+
+def _add_console_handler(level: int = logging.INFO) -> None:
+    """
+    Attach a stderr mirror for interactive / debug use.
+    Idempotent: calling it twice does not add a second handler.
+    """
+    if any(isinstance(h, logging.StreamHandler) and h.stream is sys.stderr
+           for h in log.handlers):
+        return
+    fmt = logging.Formatter(_LOG_FMT, datefmt=_LOG_DFMT)
+    sh  = logging.StreamHandler(sys.stderr)
+    sh.setFormatter(fmt)
+    sh.setLevel(level)
+    log.addHandler(sh)
+
+
+def get_log_size_mb() -> float:
+    """Return the current log file size in MB (0.0 if absent)."""
+    try:
+        return _LOG_PATH.stat().st_size / 1_048_576
+    except OSError:
+        return 0.0
+
+
+log.info(
+    "Storage root: %s | logs: %s | cache: %s | snapshots: %s | health: %s",
+    BASE_DIR, _DIR_LOGS, _DIR_CACHE, _DIR_SNAPSHOTS,
+    "OK" if storage_health.is_healthy() else "DEGRADED",
+)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 5 -- CONFIGURATION
+#
+#  Schema-driven validation: every key has (default, type, min, max, help).
+#  On first run, a human-readable config.json is created with a _help block.
+#  On subsequent runs, only keys present in _SCHEMA are accepted; extras are
+#  ignored (forward-compatible with future versions that add new keys).
+#  Config is written atomically; re-read only on startup.
+# ══════════════════════════════════════════════════════════════════════════════
+
+_CFG_PATH: Path = BASE_DIR / "config.json"
+
+# (default, coerce_type, min_or_None, max_or_None, description)
+_SCHEMA: Dict[str, Tuple[Any, type, Any, Any, str]] = {
+    "interval_sec":        (3,     int,   1,    3600,  "Seconds between snapshots"),
+    "max_hours":           (24,    int,   1,    720,   "Hours of history to retain in DB"),
+    "chart_points":        (120,   int,   10,   1000,  "Data points shown in history charts"),
+    "top_n":               (10,    int,   3,    50,    "Rows in per-tab top-process tables"),
+    "alert_cpu_pct":       (90.0,  float, 0.0,  100.0, "CPU % that triggers a WARNING log"),
+    "alert_ram_pct":       (85.0,  float, 0.0,  100.0, "RAM % that triggers a WARNING log"),
+    "proc_scan_interval":  (5,     int,   1,    300,   "Seconds between full process scans"),
+    "commit_every":        (5,     int,   1,    100,   "DB snapshots buffered per SQLite commit"),
+    "gpu_cache_ttl":       (4,     int,   1,    60,    "Seconds to cache GPU readings"),
+    "net_iface":           ("",    str,   None, None,  "Network interface to monitor (empty=auto)"),
+    "disk_path":           ("",    str,   None, None,  "Disk path to monitor (empty=auto)"),
+    "cache_ttl_sec":       (10,    int,   1,    300,   "Seconds to cache the build_data payload"),
+    "log_to_console":      (False, bool,  None, None,  "Mirror log lines to stderr"),
+    # Storage tuning
+    "snapshot_keep":        (200,   int,   10,  5000,  "Max JSON snapshots on disk (ring)"),
+    "snapshot_compress":    (True,  bool,  None, None, "Gzip-compress JSON snapshots"),
+    "db_commit_every":      (5,     int,   1,    100,  "Snapshots per DB transaction"),
+    "data_json_min_delta":  (0.5,   float, 0.0, 100.0, "Min metric change to re-write data.json"),
+    "export_json_max_rows": (500,   int,   10,  50000, "Max rows in per-export JSON file"),
+    "storage_warn_mb":      (100.0, float, 1.0, 1e6,   "Warn when disk free < this many MB"),
+    "config_version":       (3,     int,   1,   9999,  "Schema version — do not edit"),
+}
+
+_DEFAULTS: Dict[str, Any] = {k: v[0] for k, v in _SCHEMA.items()}
+
+
+def _coerce(key: str, raw: Any) -> Any:
+    """
+    Coerce *raw* to the expected type for *key* and clamp to [min, max].
+    Returns the schema default on any failure; logs a warning.
+    """
+    default, coerce_type, lo, hi, _ = _SCHEMA[key]
+    try:
+        if coerce_type is bool:
+            val: Any = (raw if isinstance(raw, bool)
+                        else str(raw).lower() in ("1", "true", "yes", "on"))
+        else:
+            val = coerce_type(raw)
+        if lo is not None and val < lo:
+            log.warning("Config '%s': %r < min %r — clamped to %r.", key, val, lo, lo)
+            val = lo
+        if hi is not None and val > hi:
+            log.warning("Config '%s': %r > max %r — clamped to %r.", key, val, hi, hi)
+            val = hi
+        return val
+    except (ValueError, TypeError) as exc:
+        log.warning("Config '%s': cannot coerce %r (%s) — using default %r.",
+                    key, raw, exc, default)
+        return default
+
+
+def _write_default_config() -> None:
+    """Write an annotated default config.json using atomic write."""
+    output: Dict[str, Any] = {
+        "_help":    {k: v[4] for k, v in _SCHEMA.items()},
+        "_version": _DEFAULTS["config_version"],
+    }
+    output.update(_DEFAULTS)
+    content = json.dumps(output, indent=2, ensure_ascii=False)
+    if _atomic_write_text(_CFG_PATH, content):
+        log.info("Default config written: %s", _CFG_PATH)
+    else:
+        log.warning("Cannot write default config to %s — using in-memory defaults.", _CFG_PATH)
+
+
+def _load_cfg() -> Dict[str, Any]:
+    cfg = dict(_DEFAULTS)
+
+    if not _CFG_PATH.exists():
+        _write_default_config()
+        log.info("First run — using default configuration.")
+        return cfg
+
+    # Read
+    try:
+        raw_text = _CFG_PATH.read_text(encoding="utf-8")
+    except OSError as exc:
+        log.warning("Cannot read config (%s) — using defaults.", exc)
+        return cfg
+
+    # Parse
+    try:
+        raw = json.loads(raw_text)
+    except json.JSONDecodeError as exc:
+        log.warning(
+            "Config JSON error at line %d col %d: %s — using defaults.",
+            exc.lineno, exc.colno, exc.msg,
+        )
+        return cfg
+
+    if not isinstance(raw, dict):
+        log.warning("Config is not a JSON object — using defaults.")
+        return cfg
+
+    # Version check
+    file_ver = raw.get("config_version", raw.get("_version", 1))
+    schema_ver = _DEFAULTS["config_version"]
+    if isinstance(file_ver, int) and file_ver < schema_ver:
+        log.info(
+            "Config version %d < current %d — new keys will use defaults.",
+            file_ver, schema_ver,
+        )
+
+    # Apply
+    applied = 0
+    for key in _SCHEMA:
+        if key in raw:
+            cfg[key] = _coerce(key, raw[key])
+            applied += 1
+
+    unknown = [k for k in raw
+               if k not in _SCHEMA and not k.startswith("_")]
+    if unknown:
+        log.debug("Config: %d unknown key(s) ignored: %s",
+                  len(unknown), ", ".join(unknown))
+
+    log.info("Config loaded (%d/%d keys applied, version %s).",
+             applied, len(_SCHEMA), file_ver)
+    return cfg
+
+
+CFG: Dict[str, Any] = _load_cfg()
+
+if CFG.get("log_to_console"):
+    _add_console_handler(logging.DEBUG)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 6 -- DERIVED CONSTANTS
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── Timing ────────────────────────────────────────────────────────────────────
+INTERVAL_SEC:       int   = CFG["interval_sec"]
+MAX_HOURS:          int   = CFG["max_hours"]
+MAX_SNAPSHOTS:      int   = MAX_HOURS * 3600 // INTERVAL_SEC
+PROC_SCAN_INTERVAL: int   = CFG["proc_scan_interval"]
+COMMIT_EVERY:       int   = CFG["db_commit_every"]
+GPU_CACHE_TTL:      int   = CFG["gpu_cache_ttl"]
+CACHE_TTL:          int   = CFG["cache_ttl_sec"]
+PROC_PRIME_SLEEP:   float = 0.10
+
+# ── Storage tuning ────────────────────────────────────────────────────────────
+SNAPSHOT_KEEP:        int   = CFG["snapshot_keep"]
+SNAPSHOT_COMPRESS:    bool  = CFG["snapshot_compress"]
+DATA_JSON_MIN_DELTA:  float = CFG["data_json_min_delta"]
+EXPORT_JSON_MAX_ROWS: int   = CFG["export_json_max_rows"]
+STORAGE_WARN_MB:      float = CFG["storage_warn_mb"]
+
+# Update StorageHealth thresholds from config
+storage_health.LOW_SPACE_WARN_MB = STORAGE_WARN_MB
+
+# ── Display ───────────────────────────────────────────────────────────────────
+CHART_POINTS: int = CFG["chart_points"]
+TOP_N:        int = CFG["top_n"]
+
+# ── Alerts ────────────────────────────────────────────────────────────────────
+ALERT_CPU: float = CFG["alert_cpu_pct"]
+ALERT_RAM: float = CFG["alert_ram_pct"]
+
+# ── Hardware targets ──────────────────────────────────────────────────────────
+NET_IFACE: str = CFG["net_iface"].strip()
+
+
+def _auto_disk_path() -> str:
+    if platform.system() == "Windows":
+        home_drive = os.path.splitdrive(str(Path.home()))[0] or "C:"
+        return home_drive + "\\"
+    return "/"
+
+
+_raw_disk = CFG["disk_path"].strip()
+DISK_PATH: str = _raw_disk if _raw_disk else _auto_disk_path()
+if not os.path.exists(DISK_PATH):
+    log.warning("disk_path %r not found — falling back to auto.", DISK_PATH)
+    DISK_PATH = _auto_disk_path()
+
+# ── OS / architecture helpers ─────────────────────────────────────────────────
+OS_NAME:    str  = platform.system()
+IS_WINDOWS: bool = OS_NAME == "Windows"
+IS_LINUX:   bool = OS_NAME == "Linux"
+IS_MACOS:   bool = OS_NAME == "Darwin"
+ARCH:       str  = platform.machine().lower()
+IS_ARM:     bool = ARCH.startswith(("arm", "aarch"))
+
+log.debug("Platform: %s %s | Python %s | BASE_DIR: %s",
+          OS_NAME, ARCH, sys.version.split()[0], BASE_DIR)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 7 — REQUIRED DEPENDENCY: psutil
+#  Deferred until after logging/config so the error lands in the log file too.
+# ══════════════════════════════════════════════════════════════════════════════
+_MIN_PSUTIL = (5, 9, 0)   # minimum supported version
+
+try:
+    import psutil as _psutil_probe
+
+    _ver = tuple(int(x) for x in _psutil_probe.__version__.split(".")[:3])
+    if _ver < _MIN_PSUTIL:
+        log.warning(
+            "psutil %s is older than the recommended minimum %s. "
+            "Some metrics may be unavailable.  Upgrade with: %s -m pip install -U psutil",
+            _psutil_probe.__version__,
+            ".".join(str(x) for x in _MIN_PSUTIL),
+            sys.executable,
+        )
+    import psutil   # actual import used everywhere else
+    log.debug("psutil %s loaded.", psutil.__version__)
+
+except ImportError:
+    _die(
+        textwrap.dedent(f"""\
+            psutil is not installed.
+            Install it with:
+              {sys.executable} -m pip install psutil
+            Then re-run Activity Monitor.""")
+    )
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 8 — DATA CLASSES
+# ══════════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class GpuInfo:
+    """GPU metrics for a single device."""
+    name:      str   = ""
+    load_pct:  float = 0.0
+    mem_used:  int   = 0    # MB
+    mem_total: int   = 0    # MB
+    mem_pct:   float = 0.0
+    temp_c:    float = 0.0
+
+
+@dataclass
+class ProcEntry:
+    """
+    Aggregated metrics for all processes sharing the same name.
+
+    Fields are always present with safe defaults so downstream code never
+    needs to guard against missing keys.
+
+    cpu / mem_mb are summed across all instances sharing the same name.
+    gpu_mb is 0 when the GPU backend has no VRAM data for this process.
+    gpu_supported reflects whether any GPU backend is active at all; when
+    False the caller knows gpu_mb=0 means "unsupported", not "idle".
+    """
+    pid:           int   = 0     # representative PID (first seen)
+    cpu:           float = 0.0   # total CPU % summed across instances
+    mem_mb:        float = 0.0   # total RSS MB summed across instances
+    gpu_mb:        int   = 0     # VRAM MB (0 = none used or unsupported)
+    gpu_supported: bool  = False # True when a GPU backend is active
+    instances:     int   = 1     # count of processes with this name
+    status:        str   = ""    # last known status string (informational)
+
+
+@dataclass
+class NetStats:
+    """Network I/O snapshot for one interface (or system total)."""
+    iface:       str   = ""
+    speed_tx_kb: float = 0.0   # KB/s since last reading
+    speed_rx_kb: float = 0.0
+    bytes_sent:  int   = 0     # cumulative counters
+    bytes_recv:  int   = 0
+    err_in:      int   = 0
+    err_out:     int   = 0
+
+
+@dataclass
+class DiskStats:
+    """Disk usage and I/O rate for the configured path."""
+    path:       str   = ""
+    total_gb:   float = 0.0
+    used_gb:    float = 0.0
+    free_gb:    float = 0.0
+    used_pct:   float = 0.0
+    read_mb_s:  float = 0.0   # MB/s since last reading
+    write_mb_s: float = 0.0
+
+
+@dataclass
+class Snapshot:
+    """One complete data point collected per INTERVAL_SEC."""
+    ts:        str
+    cpu:       float
+    ram_pct:   float
+    ram_used:  int
+    ram_total: int
+    gpus:      List[GpuInfo]
+    procs:     Dict[str, ProcEntry]
+    net:       NetStats
+    disk:      DiskStats
+    gpu_procs: Dict[str, int]   # process name → VRAM MB (NVIDIA only)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 9 — THREAD-SAFE TTL CACHE
+# ══════════════════════════════════════════════════════════════════════════════
+
+class _Cache:
+    """
+    Simple in-memory key/value store with per-entry TTL expiry.
+    All operations are thread-safe via a single reentrant lock.
+    """
+
+    def __init__(self, ttl: int) -> None:
+        self._d:   Dict[str, Tuple[Any, float]] = {}
+        self._ttl: int = ttl
+        self._lock = threading.Lock()
+
+    def get(self, key: str) -> Optional[Any]:
+        with self._lock:
+            entry = self._d.get(key)
+            if entry is None:
+                return None
+            value, stored_at = entry
+            if time.time() - stored_at > self._ttl:
+                del self._d[key]
+                return None
+            return value
+
+    def set(self, key: str, val: Any) -> None:
+        with self._lock:
+            self._d[key] = (val, time.time())
+
+    def drop(self, key: str) -> None:
+        with self._lock:
+            self._d.pop(key, None)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._d.clear()
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._d)
+
+
+_cache = _Cache(CACHE_TTL)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 10 — GPU  (NVIDIA · AMD · Intel · macOS · Windows · Linux /sys)
+#
+#  Detection tries each backend in order of richness.  A backend is accepted
+#  only if it can actually enumerate at least one device.  Every backend is
+#  wrapped in its own try/except so a broken library never blocks the others.
+#
+#  Supported backends
+#  ─────────────────
+#  pynvml      – NVIDIA, full detail + per-process VRAM (best on Linux/Win)
+#  nvidiasmi   – NVIDIA fallback via CLI (slower, no library needed)
+#  gputil      – NVIDIA wrapper (thin, Windows-friendly)
+#  amd         – AMD via pyamdgpuinfo (Linux)
+#  macos_sp    – any GPU via system_profiler (macOS, load not available)
+#  win_wmic    – any GPU via WMIC (Windows, load via PDH or unavailable)
+#  intel_sys   – Intel iGPU via /sys frequency proxy (Linux)
+#  linux_drm   – generic DRM card via /sys (Linux, load not available)
+# ══════════════════════════════════════════════════════════════════════════════
+
+_gpu_backend:   str  = ""                                        # active backend name
+_gpu_cache_lk:  threading.Lock = threading.Lock()
+_gpu_raw_cache: Optional[Tuple[List["GpuInfo"], Dict[str, int], float]] = None
+
+
+# ── Backend probes (return True only when at least one device is usable) ─────
+
+def _probe_pynvml() -> bool:
+    import pynvml
+    pynvml.nvmlInit()
+    return pynvml.nvmlDeviceGetCount() > 0
+
+def _probe_nvidiasmi() -> bool:
+    r = subprocess.run(
+        ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+        capture_output=True, timeout=2)
+    return r.returncode == 0 and bool(r.stdout.strip())
+
+def _probe_gputil() -> bool:
+    import GPUtil
+    return len(GPUtil.getGPUs()) > 0
+
+def _probe_amd() -> bool:
+    import pyamdgpuinfo
+    return pyamdgpuinfo.detect_gpus() > 0
+
+def _probe_macos_sp() -> bool:
+    if not IS_MACOS:
+        return False
+    r = subprocess.run(
+        ["system_profiler", "SPDisplaysDataType", "-json"],
+        capture_output=True, text=True, timeout=5)
+    if r.returncode != 0:
+        return False
+    try:
+        data = json.loads(r.stdout)
+        return bool(data.get("SPDisplaysDataType"))
+    except Exception:
+        return False
+
+def _probe_win_wmic() -> bool:
+    if not IS_WINDOWS:
+        return False
+    r = subprocess.run(
+        ["wmic", "path", "win32_videocontroller", "get", "name", "/format:list"],
+        capture_output=True, text=True, timeout=3)
+    return r.returncode == 0 and "Name=" in r.stdout
+
+def _probe_intel_sys() -> bool:
+    if not IS_LINUX:
+        return False
+    return os.path.exists("/sys/class/drm/card0/gt_cur_freq_mhz")
+
+def _probe_linux_drm() -> bool:
+    if not IS_LINUX:
+        return False
+    try:
+        cards = [p for p in os.listdir("/sys/class/drm")
+                 if p.startswith("card") and not p[4:].startswith("-")]
+        return bool(cards)
+    except Exception:
+        return False
+
+_GPU_PROBES: List[Tuple[str, Any]] = [
+    ("pynvml",    _probe_pynvml),
+    ("nvidiasmi", _probe_nvidiasmi),
+    ("gputil",    _probe_gputil),
+    ("amd",       _probe_amd),
+    ("macos_sp",  _probe_macos_sp),
+    ("win_wmic",  _probe_win_wmic),
+    ("intel_sys", _probe_intel_sys),
+    ("linux_drm", _probe_linux_drm),
+]
+
+def _detect_gpu() -> None:
+    global _gpu_backend
+    for name, probe in _GPU_PROBES:
+        try:
+            if probe():
+                _gpu_backend = name
+                log.info("GPU backend: %s", name)
+                return
+        except ImportError:
+            log.debug("GPU probe %s: library not installed.", name)
+        except FileNotFoundError:
+            log.debug("GPU probe %s: tool not found.", name)
+        except Exception as exc:
+            log.debug("GPU probe %s failed: %s", name, exc)
+    log.info("No GPU backend found — GPU tab will show 'unavailable'.")
+
+_detect_gpu()
+
+
+# ── Per-backend query ─────────────────────────────────────────────────────────
+
+def _safe_float(v: Any, default: float = 0.0) -> float:
+    try:
+        return float(v) if v is not None else default
+    except (TypeError, ValueError):
+        return default
+
+def _safe_int(v: Any, default: int = 0) -> int:
+    try:
+        return int(v) if v is not None else default
+    except (TypeError, ValueError):
+        return default
+
+
+def _query_pynvml() -> Tuple[List[GpuInfo], Dict[str, int]]:
+    import pynvml
+    gpus: List[GpuInfo] = []
+    gpu_procs: Dict[str, int] = {}
+    for i in range(pynvml.nvmlDeviceGetCount()):
+        h = pynvml.nvmlDeviceGetHandleByIndex(i)
+        try:
+            u  = pynvml.nvmlDeviceGetUtilizationRates(h)
+            m  = pynvml.nvmlDeviceGetMemoryInfo(h)
+            nm = pynvml.nvmlDeviceGetName(h)
+            if isinstance(nm, bytes):
+                nm = nm.decode(errors="replace")
+            mu = m.used  // 1024 ** 2
+            mt = m.total // 1024 ** 2
+            try:
+                t = float(pynvml.nvmlDeviceGetTemperature(h, pynvml.NVML_TEMPERATURE_GPU))
+            except Exception:
+                t = 0.0
+            gpus.append(GpuInfo(
+                name=nm, load_pct=_safe_float(u.gpu),
+                mem_used=mu, mem_total=mt,
+                mem_pct=round(mu / mt * 100, 1) if mt else 0.0,
+                temp_c=t,
+            ))
+            # Per-process VRAM mapping
+            for fn in (pynvml.nvmlDeviceGetComputeRunningProcesses,
+                       pynvml.nvmlDeviceGetGraphicsRunningProcesses):
+                try:
+                    for p in fn(h):
+                        try:
+                            pnm = pynvml.nvmlSystemGetProcessName(p.pid)
+                            if isinstance(pnm, bytes):
+                                pnm = pnm.decode(errors="replace")
+                            pnm = os.path.basename(pnm)
+                            vm  = _safe_int(p.usedGpuMemory) // 1024 ** 2
+                            gpu_procs[pnm] = gpu_procs.get(pnm, 0) + vm
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+        except Exception as exc:
+            log.debug("pynvml device %d: %s", i, exc)
+    return gpus, gpu_procs
+
+
+def _query_nvidiasmi() -> Tuple[List[GpuInfo], Dict[str, int]]:
+    gpus: List[GpuInfo] = []
+    gpu_procs: Dict[str, int] = {}
+    try:
+        r = subprocess.run(
+            ["nvidia-smi",
+             "--query-gpu=name,utilization.gpu,memory.used,memory.total,temperature.gpu",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=4)
+        for line in r.stdout.strip().splitlines():
+            p = [x.strip() for x in line.split(",")]
+            if len(p) >= 5:
+                mu, mt = _safe_int(p[2]), _safe_int(p[3])
+                gpus.append(GpuInfo(
+                    name=p[0], load_pct=_safe_float(p[1]),
+                    mem_used=mu, mem_total=mt,
+                    mem_pct=round(mu / mt * 100, 1) if mt else 0.0,
+                    temp_c=_safe_float(p[4]),
+                ))
+    except Exception as exc:
+        log.debug("nvidia-smi query: %s", exc)
+    # Per-process VRAM
+    try:
+        r2 = subprocess.run(
+            ["nvidia-smi", "--query-compute-apps=pid,name,used_memory",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=4)
+        for line in r2.stdout.strip().splitlines():
+            p = [x.strip() for x in line.split(",")]
+            if len(p) >= 3:
+                pnm = os.path.basename(p[1])
+                gpu_procs[pnm] = gpu_procs.get(pnm, 0) + _safe_int(p[2])
+    except Exception:
+        pass
+    return gpus, gpu_procs
+
+
+def _query_gputil() -> Tuple[List[GpuInfo], Dict[str, int]]:
+    import GPUtil
+    gpus: List[GpuInfo] = []
+    for g in GPUtil.getGPUs():
+        mu, mt = _safe_int(g.memoryUsed), _safe_int(g.memoryTotal)
+        gpus.append(GpuInfo(
+            name=g.name or "GPU",
+            load_pct=round(_safe_float(g.load) * 100, 1),
+            mem_used=mu, mem_total=mt,
+            mem_pct=round(_safe_float(g.memoryUtil) * 100, 1),
+            temp_c=_safe_float(g.temperature),
+        ))
+    return gpus, {}
+
+
+def _query_amd() -> Tuple[List[GpuInfo], Dict[str, int]]:
+    import pyamdgpuinfo
+    gpus: List[GpuInfo] = []
+    for i in range(pyamdgpuinfo.detect_gpus()):
+        try:
+            g    = pyamdgpuinfo.get_gpu(i)
+            load = round(_safe_float(g.query_load()) * 100, 1)
+            mu   = _safe_int((g.query_vram_usage() or 0) // 1024 ** 2)
+            mt   = _safe_int((g.memory_info.get("vram_size", 0)) // 1024 ** 2)
+            temp = _safe_float(g.query_temperature())
+            gpus.append(GpuInfo(
+                name=g.name or "AMD GPU",
+                load_pct=load,
+                mem_used=mu, mem_total=mt,
+                mem_pct=round(mu / mt * 100, 1) if mt else 0.0,
+                temp_c=temp,
+            ))
+        except Exception as exc:
+            log.debug("AMD GPU %d: %s", i, exc)
+    return gpus, {}
+
+
+def _query_macos_sp() -> Tuple[List[GpuInfo], Dict[str, int]]:
+    """macOS system_profiler: name only (load/temp not exposed without root)."""
+    gpus: List[GpuInfo] = []
+    try:
+        r = subprocess.run(
+            ["system_profiler", "SPDisplaysDataType", "-json"],
+            capture_output=True, text=True, timeout=6)
+        data = json.loads(r.stdout)
+        for item in data.get("SPDisplaysDataType", []):
+            name = item.get("sppci_model") or item.get("_name") or "GPU"
+            vram_str = item.get("spdisplays_vram") or item.get("spdisplays_vram_shared") or ""
+            # Parse VRAM string like "8 GB" or "1536 MB"
+            mt = 0
+            parts = vram_str.upper().split()
+            if len(parts) == 2:
+                try:
+                    num = int(parts[0])
+                    mt  = num * 1024 if parts[1] == "GB" else num
+                except ValueError:
+                    pass
+            gpus.append(GpuInfo(name=name, mem_total=mt))
+    except Exception as exc:
+        log.debug("macOS system_profiler GPU: %s", exc)
+    return gpus, {}
+
+
+def _query_win_wmic() -> Tuple[List[GpuInfo], Dict[str, int]]:
+    """Windows WMIC: name + VRAM (load via PDH is too heavy; omitted)."""
+    gpus: List[GpuInfo] = []
+    try:
+        r = subprocess.run(
+            ["wmic", "path", "win32_videocontroller",
+             "get", "Name,AdapterRAM", "/format:csv"],
+            capture_output=True, text=True, timeout=5)
+        for line in r.stdout.strip().splitlines()[1:]:  # skip header
+            p = [x.strip() for x in line.split(",")]
+            # CSV format: Node,AdapterRAM,Name
+            if len(p) >= 3 and p[-1]:
+                mt = _safe_int(p[-2]) // 1024 ** 2
+                gpus.append(GpuInfo(name=p[-1], mem_total=mt))
+    except Exception as exc:
+        log.debug("Windows WMIC GPU: %s", exc)
+    return gpus, {}
+
+
+def _query_intel_sys() -> Tuple[List[GpuInfo], Dict[str, int]]:
+    """Intel iGPU on Linux: approximate load from GT frequency ratio."""
+    try:
+        cur_p = "/sys/class/drm/card0/gt_cur_freq_mhz"
+        max_p = "/sys/class/drm/card0/gt_max_freq_mhz"
+        freq  = int(Path(cur_p).read_text().strip())
+        mf    = max(1, int(Path(max_p).read_text().strip())) if Path(max_p).exists() else 100
+        load  = round(freq / mf * 100, 1)
+        return [GpuInfo(name="Intel iGPU", load_pct=load)], {}
+    except Exception as exc:
+        log.debug("Intel /sys GPU: %s", exc)
+    return [], {}
+
+
+def _query_linux_drm() -> Tuple[List[GpuInfo], Dict[str, int]]:
+    """Generic DRM card detection (name from /sys, no load available)."""
+    gpus: List[GpuInfo] = []
+    try:
+        drm = Path("/sys/class/drm")
+        for card in sorted(drm.iterdir()):
+            if not card.name.startswith("card") or card.name[4:].startswith("-"):
+                continue
+            vendor_p = card / "device" / "vendor"
+            name_p   = card / "device" / "uevent"
+            name = card.name
+            if name_p.exists():
+                for ln in name_p.read_text(errors="replace").splitlines():
+                    if ln.startswith("DRIVER="):
+                        name = f"{card.name} ({ln.split('=',1)[1]})"
+                        break
+            gpus.append(GpuInfo(name=name))
+    except Exception as exc:
+        log.debug("Linux DRM GPU: %s", exc)
+    return gpus, {}
+
+
+_GPU_QUERIES: Dict[str, Any] = {
+    "pynvml":    _query_pynvml,
+    "nvidiasmi": _query_nvidiasmi,
+    "gputil":    _query_gputil,
+    "amd":       _query_amd,
+    "macos_sp":  _query_macos_sp,
+    "win_wmic":  _query_win_wmic,
+    "intel_sys": _query_intel_sys,
+    "linux_drm": _query_linux_drm,
+}
+
+
+def _query_gpu_raw() -> Tuple[List[GpuInfo], Dict[str, int]]:
+    if not _gpu_backend:
+        return [], {}
+    fn = _GPU_QUERIES.get(_gpu_backend)
+    if fn is None:
+        return [], {}
+    try:
+        return fn()
+    except Exception as exc:
+        log.debug("GPU query (%s) failed: %s\n%s", _gpu_backend, exc, traceback.format_exc())
+        return [], {}
+
+
+def get_gpu() -> Tuple[List[GpuInfo], Dict[str, int]]:
+    """Return (gpu_list, gpu_proc_map) from cache or a fresh query."""
+    global _gpu_raw_cache
+    now = time.time()
+    with _gpu_cache_lk:
+        if _gpu_raw_cache and now - _gpu_raw_cache[2] < GPU_CACHE_TTL:
+            return _gpu_raw_cache[0], _gpu_raw_cache[1]
+        gpus, procs = _query_gpu_raw()
+        _gpu_raw_cache = (gpus, procs, now)
+        return gpus, procs
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 11 — CPU  (total + per-core + frequency + temperature)
+# ══════════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class CpuInfo:
+    """Extended CPU snapshot including per-core and temperature data."""
+    total_pct:    float = 0.0
+    per_core:     List[float] = field(default_factory=list)   # one entry per logical core
+    freq_mhz:     float = 0.0   # current frequency of core 0 (or average)
+    freq_max_mhz: float = 0.0
+    temp_c:       float = 0.0   # package/die temperature, 0 if unavailable
+    physical_cores: int = 0
+    logical_cores:  int = 0
+
+
+def _read_cpu_temp() -> float:
+    """
+    Try to read CPU package temperature cross-platform.
+    Returns 0.0 when unavailable (macOS without sudo, most Windows configs).
+    Priority:  psutil sensors → Linux /sys thermal zones → skip on other OS.
+    """
+    # psutil sensors_temperatures (Linux & some macOS with coretemp module)
+    try:
+        sensors = psutil.sensors_temperatures()
+        if sensors:
+            # Look for the most meaningful key in order of preference
+            for key in ("coretemp", "k10temp", "zenpower", "cpu_thermal",
+                        "acpitz", "soc_thermal", "Package id 0"):
+                if key in sensors and sensors[key]:
+                    # Use the package or max-label entry when available
+                    entries = sensors[key]
+                    pkg = next((e for e in entries
+                                if "package" in e.label.lower() or e.label == ""), None)
+                    return round((pkg or entries[0]).current, 1)
+            # Fall through to first available sensor
+            for entries in sensors.values():
+                if entries:
+                    return round(entries[0].current, 1)
+    except AttributeError:
+        pass   # sensors_temperatures not available on this OS/version
+    except Exception as exc:
+        log.debug("CPU temp (sensors): %s", exc)
+
+    # Linux /sys thermal zone fallback
+    if IS_LINUX:
+        try:
+            tz0 = Path("/sys/class/thermal/thermal_zone0/temp")
+            if tz0.exists():
+                raw = int(tz0.read_text().strip())
+                return round(raw / 1000.0, 1)   # millidegrees → °C
+        except Exception as exc:
+            log.debug("CPU temp (/sys): %s", exc)
+
+    # macOS — powermetrics requires root; skip silently
+    # Windows — WMI MSAcpi_ThermalZoneTemperature requires elevated rights; skip
+    return 0.0
+
+
+def get_cpu() -> CpuInfo:
+    """
+    Collect total CPU %, per-core %, frequency, temperature, and core counts.
+    Every sub-metric fails gracefully to 0 / empty list.
+    """
+    # ── Total + per-core ──────────────────────────────────────────────────────
+    try:
+        total_pct = psutil.cpu_percent(interval=None)
+        per_core  = psutil.cpu_percent(interval=None, percpu=True) or []
+    except Exception as exc:
+        log.debug("cpu_percent: %s", exc)
+        total_pct, per_core = 0.0, []
+
+    # ── Frequency ─────────────────────────────────────────────────────────────
+    freq_mhz = freq_max = 0.0
+    try:
+        freq = psutil.cpu_freq(percpu=False)
+        if freq:
+            freq_mhz = round(freq.current, 1)
+            freq_max  = round(freq.max,     1)
+    except Exception as exc:
+        log.debug("cpu_freq: %s", exc)
+
+    # ── Core counts ───────────────────────────────────────────────────────────
+    try:
+        phys = psutil.cpu_count(logical=False) or 0
+        logi = psutil.cpu_count(logical=True)  or 0
+    except Exception:
+        phys = logi = 0
+
+    return CpuInfo(
+        total_pct=round(total_pct, 1),
+        per_core=[round(v, 1) for v in per_core],
+        freq_mhz=freq_mhz,
+        freq_max_mhz=freq_max,
+        temp_c=_read_cpu_temp(),
+        physical_cores=phys,
+        logical_cores=logi,
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 12 — RAM  (virtual memory + swap)
+# ══════════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class RamInfo:
+    """Virtual + swap memory snapshot."""
+    total_mb:   int   = 0
+    used_mb:    int   = 0
+    avail_mb:   int   = 0
+    used_pct:   float = 0.0
+    swap_total: int   = 0    # MB
+    swap_used:  int   = 0    # MB
+    swap_pct:   float = 0.0
+
+
+def get_ram() -> RamInfo:
+    vm = RamInfo()
+    try:
+        m = psutil.virtual_memory()
+        vm.total_mb  = m.total // 1024 ** 2
+        vm.used_mb   = m.used  // 1024 ** 2
+        vm.avail_mb  = m.available // 1024 ** 2
+        vm.used_pct  = round(m.percent, 1)
+    except Exception as exc:
+        log.debug("virtual_memory: %s", exc)
+    try:
+        s = psutil.swap_memory()
+        vm.swap_total = s.total // 1024 ** 2
+        vm.swap_used  = s.used  // 1024 ** 2
+        vm.swap_pct   = round(s.percent, 1)
+    except Exception as exc:
+        log.debug("swap_memory: %s", exc)
+    return vm
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 13 — NETWORK
+#
+#  Interface selection priority:
+#    1. User-configured NET_IFACE
+#    2. Any "wifi"/"wlan"/"wi-fi"/"en0" style name that is up
+#    3. Any non-loopback up interface
+#    4. System total (pernic=False)
+#
+#  Wi-Fi extras (signal, SSID) are collected where available:
+#    Linux  : /proc/net/wireless + iw/iwconfig
+#    macOS  : airport CLI
+#    Windows: netsh wlan show interfaces
+# ══════════════════════════════════════════════════════════════════════════════
+
+_net_prev: Optional[Tuple[Any, float]] = None
+
+
+def _pick_iface() -> str:
+    """Return the best interface name (empty = use system totals)."""
+    if NET_IFACE:
+        return NET_IFACE
+    try:
+        stats = psutil.net_if_stats()
+        lo_names = {"lo", "loopback", "lo0"}
+
+        # First prefer anything that looks like Wi-Fi
+        wifi_hints = ("wlan", "wifi", "wi-fi", "wlp", "en0", "en1", "wl")
+        for name, s in stats.items():
+            if s.isup and name.lower() not in lo_names:
+                if any(name.lower().startswith(h) for h in wifi_hints):
+                    return name
+
+        # Otherwise any non-loopback up interface
+        for name, s in stats.items():
+            if s.isup and name.lower() not in lo_names:
+                return name
+    except Exception as exc:
+        log.debug("net iface pick: %s", exc)
+    return ""
+
+
+def _get_wifi_signal() -> Tuple[Optional[str], Optional[int]]:
+    """
+    Try to read SSID and signal strength (dBm or %).
+    Returns (ssid_or_None, signal_int_or_None).
+    Fails silently — this is purely cosmetic.
+    """
+    # Linux: /proc/net/wireless
+    if IS_LINUX:
+        try:
+            txt = Path("/proc/net/wireless").read_text()
+            for line in txt.splitlines()[2:]:
+                parts = line.split()
+                if len(parts) >= 4:
+                    signal = int(float(parts[3].rstrip(".")))
+                    return None, signal
+        except Exception:
+            pass
+        # iw dev … link
+        try:
+            r = subprocess.run(["iw", "dev"], capture_output=True, text=True, timeout=2)
+            iface = None
+            for ln in r.stdout.splitlines():
+                ln = ln.strip()
+                if ln.startswith("Interface "):
+                    iface = ln.split()[1]
+            if iface:
+                r2 = subprocess.run(["iw", iface, "link"],
+                                    capture_output=True, text=True, timeout=2)
+                ssid = signal = None
+                for ln in r2.stdout.splitlines():
+                    ln = ln.strip()
+                    if ln.startswith("SSID:"):
+                        ssid = ln.split(":", 1)[1].strip()
+                    if "signal:" in ln:
+                        signal = int(float(ln.split(":")[1].split()[0]))
+                return ssid, signal
+        except Exception:
+            pass
+
+    # macOS: airport
+    if IS_MACOS:
+        airport = ("/System/Library/PrivateFrameworks/Apple80211.framework"
+                   "/Versions/Current/Resources/airport")
+        try:
+            r = subprocess.run([airport, "-I"],
+                               capture_output=True, text=True, timeout=3)
+            ssid = signal = None
+            for ln in r.stdout.splitlines():
+                ln = ln.strip()
+                if ln.startswith("SSID:"):
+                    ssid = ln.split(":", 1)[1].strip()
+                if ln.startswith("agrCtlRSSI:"):
+                    signal = int(ln.split(":")[1].strip())
+            return ssid, signal
+        except Exception:
+            pass
+
+    # Windows: netsh wlan show interfaces
+    if IS_WINDOWS:
+        try:
+            r = subprocess.run(
+                ["netsh", "wlan", "show", "interfaces"],
+                capture_output=True, text=True, timeout=4, encoding="utf-8", errors="replace")
+            ssid = signal = None
+            for ln in r.stdout.splitlines():
+                ln = ln.strip()
+                if ln.startswith("SSID") and "BSSID" not in ln:
+                    ssid = ln.split(":", 1)[1].strip()
+                if ln.startswith("Signal"):
+                    try:
+                        signal = int(ln.split(":")[1].strip().rstrip("%"))
+                    except Exception:
+                        pass
+            return ssid, signal
+        except Exception:
+            pass
+
+    return None, None
+
+
+@dataclass
+class NetInfo:
+    """Extended network info including Wi-Fi extras."""
+    iface:       str   = ""
+    speed_tx_kb: float = 0.0
+    speed_rx_kb: float = 0.0
+    bytes_sent:  int   = 0
+    bytes_recv:  int   = 0
+    err_in:      int   = 0
+    err_out:     int   = 0
+    ssid:        str   = ""          # empty if wired or unavailable
+    signal_dbm:  Optional[int] = None  # None if unavailable
+    # All up interfaces for the Wi-Fi tab details
+    all_ifaces:  List[Dict[str, Any]] = field(default_factory=list)
+
+
+def get_net() -> NetInfo:
+    global _net_prev
+    iface  = _pick_iface()
+    result = NetInfo(iface=iface or "total")
+
+    try:
+        ctrs = psutil.net_io_counters(pernic=bool(iface))
+        if isinstance(ctrs, dict):
+            c = ctrs.get(iface) if iface else None
+            if c is None and ctrs:
+                c = next(iter(ctrs.values()), None)
+        else:
+            c = ctrs
+
+        if c is not None:
+            now = time.time()
+            if _net_prev:
+                pc, pt = _net_prev
+                dt_s             = max(now - pt, 0.001)
+                result.speed_tx_kb = max(0.0, round((c.bytes_sent - pc.bytes_sent) / dt_s / 1024, 1))
+                result.speed_rx_kb = max(0.0, round((c.bytes_recv - pc.bytes_recv) / dt_s / 1024, 1))
+            _net_prev           = (c, now)
+            result.bytes_sent   = c.bytes_sent
+            result.bytes_recv   = c.bytes_recv
+            result.err_in       = getattr(c, "errin",  0)
+            result.err_out      = getattr(c, "errout", 0)
+    except Exception as exc:
+        log.debug("net io counters: %s", exc)
+
+    # All interfaces summary for tab detail
+    try:
+        all_stats  = psutil.net_if_stats()
+        all_addrs  = psutil.net_if_addrs()
+        all_ctrs   = psutil.net_io_counters(pernic=True) or {}
+        lo = {"lo", "loopback", "lo0"}
+        for name, s in all_stats.items():
+            if name.lower() in lo:
+                continue
+            addr_list = all_addrs.get(name, [])
+            ipv4 = next(
+                (a.address for a in addr_list if a.family.name == "AF_INET"), "")
+            ctr = all_ctrs.get(name)
+            result.all_ifaces.append({
+                "name":   name,
+                "up":     s.isup,
+                "speed":  s.speed,      # Mbps, 0 = unknown
+                "ipv4":   ipv4,
+                "sent_mb":  round(ctr.bytes_sent / 1024 ** 2, 1) if ctr else 0,
+                "recv_mb":  round(ctr.bytes_recv / 1024 ** 2, 1) if ctr else 0,
+            })
+    except Exception as exc:
+        log.debug("net all_ifaces: %s", exc)
+
+    # Wi-Fi extras (best-effort, non-blocking)
+    try:
+        ssid, sig    = _get_wifi_signal()
+        result.ssid       = ssid or ""
+        result.signal_dbm = sig
+    except Exception:
+        pass
+
+    return result
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 14 — DISK  (all mounted partitions + I/O rates)
+# ══════════════════════════════════════════════════════════════════════════════
+
+_disk_prev: Optional[Tuple[Any, float]] = None
+
+
+@dataclass
+class PartitionInfo:
+    """Stats for one mounted filesystem partition."""
+    device:     str   = ""
+    mountpoint: str   = ""
+    fstype:     str   = ""
+    total_gb:   float = 0.0
+    used_gb:    float = 0.0
+    free_gb:    float = 0.0
+    used_pct:   float = 0.0
+
+
+@dataclass
+class DiskInfo:
+    """Aggregated disk stats: primary path + all partitions + I/O rates."""
+    path:        str   = ""
+    total_gb:    float = 0.0
+    used_gb:     float = 0.0
+    free_gb:     float = 0.0
+    used_pct:    float = 0.0
+    read_mb_s:   float = 0.0
+    write_mb_s:  float = 0.0
+    partitions:  List[PartitionInfo] = field(default_factory=list)
+
+
+def _get_partitions() -> List[PartitionInfo]:
+    """Return stats for every readable mounted partition."""
+    parts: List[PartitionInfo] = []
+    skip_fstypes = {
+        "tmpfs", "devtmpfs", "proc", "sysfs", "cgroup", "cgroup2",
+        "devfs", "debugfs", "securityfs", "pstore", "hugetlbfs",
+        "mqueue", "fusectl", "configfs", "binfmt_misc",
+    }
+    try:
+        for p in psutil.disk_partitions(all=False):
+            if p.fstype.lower() in skip_fstypes:
+                continue
+            # Skip virtual Windows drives (CD-ROM etc.)
+            if IS_WINDOWS and p.fstype == "":
+                continue
+            try:
+                u = psutil.disk_usage(p.mountpoint)
+                parts.append(PartitionInfo(
+                    device=p.device,
+                    mountpoint=p.mountpoint,
+                    fstype=p.fstype,
+                    total_gb=round(u.total / 1024 ** 3, 1),
+                    used_gb=round(u.used  / 1024 ** 3, 1),
+                    free_gb=round(u.free  / 1024 ** 3, 1),
+                    used_pct=round(u.percent, 1),
+                ))
+            except (PermissionError, OSError):
+                pass   # network mounts, encrypted volumes not yet unlocked, etc.
+    except Exception as exc:
+        log.debug("disk partitions: %s", exc)
+    return parts
+
+
+def get_disk() -> DiskInfo:
+    global _disk_prev
+    result = DiskInfo(path=DISK_PATH)
+
+    # Primary path stats
+    try:
+        u = psutil.disk_usage(DISK_PATH)
+        result.total_gb = round(u.total / 1024 ** 3, 1)
+        result.used_gb  = round(u.used  / 1024 ** 3, 1)
+        result.free_gb  = round(u.free  / 1024 ** 3, 1)
+        result.used_pct = round(u.percent, 1)
+    except Exception as exc:
+        log.debug("disk_usage(%s): %s", DISK_PATH, exc)
+
+    # System-wide I/O rates
+    try:
+        dc  = psutil.disk_io_counters(perdisk=False)
+        now = time.time()
+        if dc and _disk_prev:
+            pc, pt = _disk_prev
+            dt_s            = max(now - pt, 0.001)
+            result.read_mb_s  = max(0.0, round((dc.read_bytes  - pc.read_bytes)  / dt_s / 1024 ** 2, 2))
+            result.write_mb_s = max(0.0, round((dc.write_bytes - pc.write_bytes) / dt_s / 1024 ** 2, 2))
+        if dc:
+            _disk_prev = (dc, now)
+    except Exception as exc:
+        log.debug("disk_io_counters: %s", exc)
+
+    # All partitions
+    result.partitions = _get_partitions()
+    return result
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 15 -- PROCESS SCANNER  v3
+#
+#  Design goals
+#  ============
+#  Stable at 2 000+ processes on Windows (primary), Linux, and macOS.
+#  Never crash: every OS call is individually guarded; inaccessible
+#  processes are counted and debug-logged, never raised.
+#
+#  Core algorithm: prime → sleep → read
+#  =====================================
+#  psutil's cpu_percent(interval=None) works by computing the delta between
+#  two successive calls on the *same Process object*.  Two calls separated by
+#  at least PROC_PRIME_SLEEP (100 ms) produce an accurate reading.
+#
+#  Pass 1  process_iter with a minimal attrs list → prime cpu counters.
+#  Sleep   PROC_PRIME_SLEEP so the OS accumulates CPU ticks.
+#  Pass 2  Iterate cached handles → read cpu delta + RSS → aggregate.
+#
+#  Key design decisions
+#  ====================
+#  - Name caching in handle tuple: the name is resolved ONCE in pass-1 and
+#    stored in the handle so pass-2 makes zero extra OS calls per process.
+#  - PID-reuse safety: handles are keyed by PID; create_time is compared on
+#    every pass-1 touch.  A recycled PID replaces the old handle immediately.
+#  - Handle cap: _proc_handles is bounded to _HANDLE_CAP entries to prevent
+#    unbounded RAM growth on systems with rapid process churn.
+#  - Set-difference eviction: dead PIDs are found with a single O(n) set
+#    difference, not an O(n) list comprehension + O(1) membership test.
+#  - Windows specialties: PIDs 0 and 4 (System Idle / System) are harmless
+#    but generate AccessDenied on some calls; they are caught silently.
+#    STATUS_* constants are resolved with getattr so missing ones don't crash.
+#  - GPU "unsupported" vs "0 usage": ProcEntry.gpu_supported is False when
+#    no GPU backend is active, so callers can distinguish "no GPU" from "idle".
+#  - Log rate limiting: the slow-scan warning is suppressed if it fires on
+#    consecutive cycles to avoid flooding the log file.
+#
+#  Thread safety
+#  =============
+#  _proc_handles and _last_proc_scan are only written by the collector thread.
+#  No lock is needed.
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── Configuration constants ───────────────────────────────────────────────────
+
+# Attributes fetched in a single process_iter call.
+# Keep the list minimal: each extra attr adds a syscall per process on Linux.
+_PROC_ATTRS: List[str] = [
+    "pid", "name", "status", "cpu_percent", "memory_info", "create_time",
+]
+
+# Status strings that indicate a process is already dead and can be skipped.
+# Built dynamically so missing constants on old psutil versions are safe.
+_SKIP_STATUSES: frozenset = frozenset(
+    s for s in (
+        getattr(psutil, "STATUS_ZOMBIE",  None),
+        getattr(psutil, "STATUS_DEAD",    None),
+    )
+    if s is not None
+)
+
+# PIDs that are always present on Windows and always raise AccessDenied for
+# some calls.  We include them in stats but skip attribute queries for them.
+_WINDOWS_SYSTEM_PIDS: frozenset = frozenset({0, 4})
+
+# Hard cap on the handle cache size.  At 2 000 processes each handle is a
+# lightweight Python object (~200 bytes), so 4 096 entries ≈ 800 KB max.
+# When the cap is reached the LRU-style eviction keeps the most recently
+# seen PIDs (live_pids) and drops any excess cached handles.
+_HANDLE_CAP: int = 4096
+
+# Slow-scan warning: only log once per this many consecutive slow cycles
+# to avoid flooding the log file on a consistently loaded system.
+_SLOW_WARN_EVERY: int = 10
+
+
+# ── Handle cache ──────────────────────────────────────────────────────────────
+# Tuple layout: (psutil.Process, create_time_float, cached_name_str)
+# Storing the name here means pass-2 never calls p.name() or accesses p.info.
+_ProcHandleTuple = Tuple["psutil.Process", float, str]
+_proc_handles:   Dict[int, _ProcHandleTuple] = {}
+_last_proc_scan: float = 0.0
+_slow_warn_count: int  = 0   # consecutive slow scans (for rate-limiting)
+
+
+# ── GPU availability flag ─────────────────────────────────────────────────────
+def _gpu_active() -> bool:
+    """Return True when any GPU backend has been detected."""
+    return bool(_gpu_backend)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ScannerStats  —  per-cycle telemetry attached to every Snapshot
+# ══════════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class ScannerStats:
+    """
+    Lightweight diagnostics emitted every scan cycle.
+    Attached to Snapshot.scan_stats for dashboard display and debug.
+    """
+    total_seen:      int   = 0    # PIDs returned by process_iter
+    skipped_access:  int   = 0    # AccessDenied / ZombieProcess
+    skipped_gone:    int   = 0    # NoSuchProcess (race-condition exits)
+    skipped_status:  int   = 0    # zombie / dead status at scan time
+    skipped_system:  int   = 0    # Windows system PIDs (0, 4)
+    new_handles:     int   = 0    # freshly created or refreshed handles
+    recycled_pids:   int   = 0    # handles replaced due to PID reuse
+    aggregated:      int   = 0    # duplicate names merged (instances > 1)
+    handles_cached:  int   = 0    # live handle count after eviction
+    unique_names:    int   = 0    # distinct process names in result
+    scan_ms:         float = 0.0  # wall-clock duration (ms)
+    gpu_supported:   bool  = False  # whether GPU backend was active
+
+
+_last_stats: ScannerStats = ScannerStats()
+
+
+def get_scanner_stats() -> ScannerStats:
+    """Return a copy of the most recent scan telemetry (safe to call anytime)."""
+    return ScannerStats(**vars(_last_stats))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Safe attribute helpers
+#  Each function returns a clean default on ANY error so the main loops stay
+#  completely flat — no nested try/except required at the call site.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _safe_name(p: "psutil.Process", info: Dict[str, Any]) -> str:
+    """
+    Resolve a display name from a process_iter info dict.
+
+    Resolution order:
+      1. info["name"]  — already fetched, zero extra cost
+      2. p.name()      — direct call fallback (may raise)
+      3. "Unknown"     — when all else fails
+
+    On Windows, strips .exe suffix so "chrome.exe" groups with "chrome"
+    across 32-bit / 64-bit variants that may appear differently.
+    The strip is lowercase-safe: "CHROME.EXE" and "chrome.exe" both match.
+    """
+    raw = (info.get("name") or "").strip()
+    if not raw:
+        try:
+            raw = (p.name() or "").strip()
+        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+            return "Unknown"
+    if IS_WINDOWS and len(raw) > 4 and raw[-4:].lower() == ".exe":
+        raw = raw[:-4]
+    return raw or "Unknown"
+
+
+def _safe_create_time(p: "psutil.Process", info: Dict[str, Any]) -> float:
+    """
+    Return the process creation timestamp (Unix epoch float).
+    Falls back to a direct p.create_time() call if info is empty.
+    Returns 0.0 on any failure; the caller treats 0.0 as "always refresh".
+    """
+    try:
+        ct = info.get("create_time")
+        if ct is not None:
+            return float(ct)
+        return float(p.create_time())
+    except (psutil.NoSuchProcess, psutil.AccessDenied, ValueError, OSError):
+        return 0.0
+
+
+def _safe_mem_mb(p: "psutil.Process") -> float:
+    """
+    Read RSS in MB from a cached Process handle.
+    Tries memory_info() first; on failure returns 0.0 without raising.
+    MemoryError is included because some platforms return absurd values
+    that cause int overflow in the conversion.
+    """
+    try:
+        mi = p.memory_info()
+        if mi is None:
+            return 0.0
+        rss = mi.rss
+        if not isinstance(rss, int) or rss < 0:
+            return 0.0
+        return round(rss / 1_048_576, 1)   # 1_048_576 = 1024**2
+    except (psutil.NoSuchProcess, psutil.AccessDenied,
+            psutil.ZombieProcess, OSError, OverflowError, MemoryError):
+        return 0.0
+
+
+def _safe_cpu_read(p: "psutil.Process") -> float:
+    """
+    Read the cpu_percent delta since the last call on this handle.
+    Returns 0.0 on any error.  Never blocks (interval=None).
+    """
+    try:
+        val = p.cpu_percent(None)
+        if val is None or val < 0:
+            return 0.0
+        # Clamp to a sanity ceiling: 100% * logical cores
+        # (psutil can return >100 on multi-core systems by design)
+        return round(float(val), 2)
+    except (psutil.NoSuchProcess, psutil.AccessDenied,
+            psutil.ZombieProcess, OSError, ValueError):
+        return 0.0
+
+
+def _safe_prime_cpu(p: "psutil.Process") -> None:
+    """
+    Call cpu_percent(None) once to start/reset the measurement window.
+    All errors are silently swallowed; a failed prime just means cpu=0
+    in the next pass, which is the safe fallback.
+    """
+    try:
+        p.cpu_percent(None)
+    except (psutil.NoSuchProcess, psutil.AccessDenied,
+            psutil.ZombieProcess, OSError):
+        pass
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  _scan_procs  —  the core scanner
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _scan_procs(gpu_procs: Dict[str, int]) -> Tuple[Dict[str, ProcEntry], ScannerStats]:
+    """
+    Full process scan.  Returns (aggregated_dict, scan_stats).
+
+    aggregated_dict  Dict[name, ProcEntry]  one entry per unique process name
+    scan_stats       ScannerStats           per-cycle diagnostics
+
+    Two-pass algorithm
+    ------------------
+    Pass 1  (process_iter with _PROC_ATTRS)
+            For each process in the OS process table:
+              a. Check status — skip zombie/dead immediately.
+              b. Skip Windows system PIDs (0, 4) that always deny.
+              c. Resolve create_time for PID-reuse detection.
+              d. Resolve and cache the display name.
+              e. Store/refresh the handle in _proc_handles.
+              f. Prime the CPU counter (_safe_prime_cpu).
+            Each step (c-f) is independently guarded so a failure in one
+            does not affect any other process or the loop continuation.
+
+    Evict   Dead PIDs are removed from _proc_handles in a single pass using
+            set difference (O(n), no temporary list).
+
+    Sleep   PROC_PRIME_SLEEP seconds so the OS accumulates CPU ticks.
+
+    Pass 2  For each cached handle:
+              a. Read CPU delta (_safe_cpu_read — never blocks).
+              b. Read RSS in MB (_safe_mem_mb — never blocks).
+              c. Retrieve the cached name (zero OS calls).
+              d. Aggregate into result dict (sum CPU + RAM per name).
+            Processes that exited between pass-1 and pass-2 are evicted
+            silently and counted in stats.skipped_gone.
+
+    GPU     Inject VRAM MB from gpu_procs after the scan.
+            gpu_procs is always a plain dict (possibly empty).
+            When no GPU backend is active, gpu_mb stays 0 for all entries
+            and ProcEntry.gpu_supported is set to False.
+    """
+    global _proc_handles, _last_stats, _slow_warn_count
+
+    stats    = ScannerStats(gpu_supported=_gpu_active())
+    t0       = time.monotonic()
+    live_pids: set = set()
+
+    # =========================================================================
+    #  Pass 1: enumerate processes, prime CPU counters
+    # =========================================================================
+    try:
+        for p in psutil.process_iter(_PROC_ATTRS):
+            # ── Outer guard: catches any error process_iter emits per-entry ──
+            try:
+                info = p.info   # pre-fetched dict; may have partial data
+                pid  = p.pid
+                stats.total_seen += 1
+
+                # (a) Status check — skip dead/zombie without an extra syscall
+                status = (info.get("status") or "").strip()
+                if status in _SKIP_STATUSES:
+                    stats.skipped_status += 1
+                    continue
+
+                # (b) Windows system PID guard
+                if IS_WINDOWS and pid in _WINDOWS_SYSTEM_PIDS:
+                    stats.skipped_system += 1
+                    live_pids.add(pid)   # keep in live set to prevent churn
+                    continue
+
+                live_pids.add(pid)
+
+                # (c) PID-reuse detection via create_time
+                ct     = _safe_create_time(p, info)
+                cached = _proc_handles.get(pid)
+
+                if cached is None:
+                    # Brand-new PID
+                    name = _safe_name(p, info)
+                    _proc_handles[pid] = (p, ct, name)
+                    stats.new_handles += 1
+                elif cached[1] != ct:
+                    # Same PID, different create_time → recycled PID
+                    name = _safe_name(p, info)
+                    _proc_handles[pid] = (p, ct, name)
+                    stats.recycled_pids += 1
+                    stats.new_handles   += 1
+                # else: existing, valid handle — no update needed
+
+                # (f) Prime the CPU counter (independent guard)
+                _safe_prime_cpu(_proc_handles[pid][0])
+
+            except psutil.NoSuchProcess:
+                stats.skipped_gone += 1
+            except (psutil.AccessDenied, psutil.ZombieProcess):
+                stats.skipped_access += 1
+            except OSError:
+                stats.skipped_access += 1
+            except Exception as exc:
+                # Truly unexpected per-process error — log once and continue
+                log.debug("proc scan pass-1 pid=%s: %s",
+                          getattr(p, "pid", "?"), exc)
+
+    except Exception as exc:
+        # process_iter itself failed (e.g. /proc unmounted on Linux)
+        log.debug("proc scan pass-1 iter: %s", exc)
+
+    # =========================================================================
+    #  Evict dead handles using set difference (O(n), no list comprehension)
+    # =========================================================================
+    dead_pids = _proc_handles.keys() - live_pids
+    for pid in dead_pids:
+        del _proc_handles[pid]
+
+    # Enforce handle cap to prevent unbounded memory growth on systems with
+    # rapid process churn.  When over cap, keep only the live PIDs we just saw.
+    if len(_proc_handles) > _HANDLE_CAP:
+        excess = set(_proc_handles.keys()) - live_pids
+        for pid in list(excess)[: len(_proc_handles) - _HANDLE_CAP]:
+            _proc_handles.pop(pid, None)
+        log.debug("proc handle cap hit: evicted %d extra handles.", len(dead_pids))
+
+    stats.handles_cached = len(_proc_handles)
+
+    # =========================================================================
+    #  Sleep: CPU measurement window
+    # =========================================================================
+    time.sleep(PROC_PRIME_SLEEP)
+
+    # =========================================================================
+    #  Pass 2: read metrics, aggregate by name
+    # =========================================================================
+    result: Dict[str, ProcEntry] = {}
+    gpu_flag = stats.gpu_supported
+
+    for pid, handle_tuple in list(_proc_handles.items()):
+        # Unpack tuple: (Process, create_time, cached_name)
+        # The name is resolved once in pass-1 and stored here — zero OS calls.
+        try:
+            p, _ct, name = handle_tuple
+        except (TypeError, ValueError):
+            # Malformed entry (should never happen) — skip and evict
+            _proc_handles.pop(pid, None)
+            continue
+
+        try:
+            cpu    = _safe_cpu_read(p)
+            mem_mb = _safe_mem_mb(p)
+
+            if name in result:
+                entry           = result[name]
+                entry.cpu       = round(entry.cpu    + cpu,    2)
+                entry.mem_mb    = round(entry.mem_mb + mem_mb, 1)
+                entry.instances += 1
+                stats.aggregated += 1
+            else:
+                result[name] = ProcEntry(
+                    pid           = pid,
+                    cpu           = cpu,
+                    mem_mb        = mem_mb,
+                    gpu_mb        = 0,
+                    gpu_supported = gpu_flag,
+                    instances     = 1,
+                )
+
+        except psutil.NoSuchProcess:
+            # Process exited between pass-1 and pass-2 — evict silently
+            _proc_handles.pop(pid, None)
+            stats.skipped_gone += 1
+        except (psutil.AccessDenied, psutil.ZombieProcess):
+            stats.skipped_access += 1
+        except OSError:
+            stats.skipped_access += 1
+        except Exception as exc:
+            log.debug("proc scan pass-2 pid=%d: %s", pid, exc)
+
+    stats.unique_names = len(result)
+
+    # =========================================================================
+    #  GPU VRAM injection
+    #
+    #  gpu_procs maps process name -> VRAM MB and is populated only when a
+    #  GPU backend with per-process visibility is active (pynvml / nvidia-smi).
+    #  On all other platforms and GPU backends it is an empty dict, making
+    #  this loop a no-op.  gpu_mb=0 with gpu_supported=False clearly signals
+    #  "GPU monitoring not available" to the dashboard.
+    # =========================================================================
+    if gpu_flag and gpu_procs:
+        for gname, vram_mb in gpu_procs.items():
+            if gname in result:
+                result[gname].gpu_mb = _safe_int(vram_mb)
+
+    # =========================================================================
+    #  Finalise stats and slow-scan rate-limited warning
+    # =========================================================================
+    stats.scan_ms = round((time.monotonic() - t0) * 1000, 1)
+
+    if stats.scan_ms > 500:
+        _slow_warn_count += 1
+        if _slow_warn_count % _SLOW_WARN_EVERY == 1:
+            log.debug(
+                "Slow proc scan #%d: %.0f ms | seen=%d unique=%d handles=%d "
+                "new=%d recycled=%d skipped(access=%d gone=%d status=%d system=%d)",
+                _slow_warn_count, stats.scan_ms,
+                stats.total_seen, stats.unique_names, stats.handles_cached,
+                stats.new_handles, stats.recycled_pids,
+                stats.skipped_access, stats.skipped_gone,
+                stats.skipped_status, stats.skipped_system,
+            )
+    else:
+        _slow_warn_count = 0   # reset consecutive count on a fast scan
+
+    _last_stats = stats
+    return result, stats
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 16 -- COLLECTOR  (assembles one complete Snapshot per cycle)
+# ══════════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class Snapshot:
+    """One complete data point collected per INTERVAL_SEC."""
+    ts:          str
+    cpu:         "CpuInfo"
+    ram:         "RamInfo"
+    gpus:        "List[GpuInfo]"
+    procs:       Dict[str, ProcEntry]
+    net:         "NetInfo"
+    disk:        "DiskInfo"
+    gpu_procs:   Dict[str, int]           # process name -> GPU VRAM MB
+    scan_stats:  ScannerStats = field(default_factory=ScannerStats)
+
+
+def collect(prev: Dict[str, ProcEntry]) -> Snapshot:
+    """
+    Gather all hardware metrics and return a Snapshot.
+
+    Execution order
+    ===============
+    1. Prime the system-wide CPU counter (no sleep yet).
+    2. Fetch GPU data early so gpu_procs is ready before the proc scan.
+    3. Decide whether a proc scan is due (time-based throttle).
+       - Due:     run _scan_procs() which sleeps PROC_PRIME_SLEEP internally.
+       - Not due: sleep PROC_PRIME_SLEEP directly to keep the system CPU
+                  measurement window consistent across all cycles.
+    4. Read system CPU + RAM AFTER the sleep (accurate delta window).
+    5. Read net + disk (fast; no sleep dependency).
+    6. Fire log warnings for threshold crossings.
+
+    The prev dict is returned unchanged on non-scan cycles so the dashboard
+    always shows the most recent process data without stale-zeroing.
+    """
+    global _last_proc_scan
+
+    # 1. Prime system CPU counter before any sleep
+    try:
+        psutil.cpu_percent(interval=None)
+    except Exception:
+        pass
+
+    # 2. GPU — early fetch so gpu_procs is ready for proc scan injection
+    try:
+        gpus, gpu_procs = get_gpu()
+    except Exception as exc:
+        log.debug("collect get_gpu: %s", exc)
+        gpus, gpu_procs = [], {}
+
+    # 3. Process scan — time-throttled by PROC_SCAN_INTERVAL seconds
+    now     = time.time()
+    do_scan = (now - _last_proc_scan) >= PROC_SCAN_INTERVAL
+
+    if do_scan:
+        try:
+            procs, scan_stats = _scan_procs(gpu_procs)
+        except Exception as exc:
+            # _scan_procs is already heavily guarded, but catch any
+            # top-level failure and reuse the previous snapshot safely
+            log.error("_scan_procs failed: %s\n%s", exc, traceback.format_exc())
+            procs, scan_stats = prev, _last_stats
+        _last_proc_scan = time.time()
+    else:
+        # No scan this cycle — sleep for a consistent CPU window
+        time.sleep(PROC_PRIME_SLEEP)
+        procs      = prev
+        scan_stats = _last_stats
+
+    # 4. System metrics — read AFTER the sleep for an accurate CPU delta
+    try:
+        cpu = get_cpu()
+    except Exception as exc:
+        log.debug("collect get_cpu: %s", exc)
+        cpu = CpuInfo()
+
+    try:
+        ram = get_ram()
+    except Exception as exc:
+        log.debug("collect get_ram: %s", exc)
+        ram = RamInfo()
+
+    # 5. Network and disk
+    try:
+        net = get_net()
+    except Exception as exc:
+        log.debug("collect get_net: %s", exc)
+        net = NetInfo()
+
+    try:
+        disk = get_disk()
+    except Exception as exc:
+        log.debug("collect get_disk: %s", exc)
+        disk = DiskInfo()
+
+    # 6. Threshold alerts
+    if cpu.total_pct >= ALERT_CPU:
+        log.warning("CPU HIGH: %.1f%% (threshold %.0f%%)", cpu.total_pct, ALERT_CPU)
+    if ram.used_pct >= ALERT_RAM:
+        log.warning("RAM HIGH: %.1f%% (threshold %.0f%%)", ram.used_pct, ALERT_RAM)
+
+    return Snapshot(
+        ts         = dt.datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+        cpu        = cpu,
+        ram        = ram,
+        gpus       = gpus,
+        procs      = procs,
+        net        = net,
+        disk       = disk,
+        gpu_procs  = gpu_procs,
+        scan_stats = scan_stats,
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 17 -- DATABASE
+#
+#  WAL + NORMAL sync + mmap give the best write throughput for our workload
+#  (append-heavy, no concurrent writers, one reader).
+#  busy_timeout=5000 prevents lock errors when the dashboard JS reader
+#  holds a read transaction slightly longer than expected.
+#
+#  Batch write buffer
+#  ==================
+#  Rows are staged in _db_buffer (capped at _DB_BUFFER_CAP entries).
+#  A flush happens every COMMIT_EVERY cycles, wrapping all rows in a
+#  single BEGIN/COMMIT.  On flush failure the rows are written to a
+#  recovery JSON file so no data is permanently lost.
+#  flush_db_buffer() is the public shutdown hook.
+# ══════════════════════════════════════════════════════════════════════════════
+
+_DB_BUFFER_CAP: int = 100   # hard cap; prevents unbounded growth on flush failure
+
+
+def _pragmas(conn: sqlite3.Connection) -> None:
+    conn.executescript("""
+        PRAGMA journal_mode  = WAL;
+        PRAGMA synchronous   = NORMAL;
+        PRAGMA foreign_keys  = ON;
+        PRAGMA cache_size    = -8000;
+        PRAGMA busy_timeout  = 5000;
+        PRAGMA temp_store    = MEMORY;
+        PRAGMA mmap_size     = 268435456;
+    """)
+
+
+def _wal_checkpoint(conn: sqlite3.Connection) -> None:
+    """Passive WAL checkpoint — runs in background, never blocks."""
+    try:
+        conn.execute("PRAGMA wal_checkpoint(PASSIVE);")
+    except Exception as exc:
+        log.debug("WAL checkpoint: %s", exc)
+
+
+def init_db(conn: sqlite3.Connection) -> None:
+    try:
+        _pragmas(conn)
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS sessions(
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                user       TEXT, host TEXT, os TEXT, py TEXT,
+                started_at TEXT DEFAULT(strftime('%Y-%m-%dT%H:%M:%S','now','localtime')));
+
+            CREATE TABLE IF NOT EXISTS snapshots(
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id INTEGER NOT NULL REFERENCES sessions(id),
+                ts         TEXT,
+                cpu_pct    REAL, cpu_freq REAL, cpu_temp REAL,
+                ram_pct    REAL, ram_used INTEGER, ram_total INTEGER,
+                swap_pct   REAL,
+                gpu0_load  REAL, gpu0_mem_pct REAL, gpu0_temp REAL,
+                net_tx_kb  REAL, net_rx_kb    REAL,
+                disk_pct   REAL, disk_rd_mbs  REAL, disk_wr_mbs REAL,
+                proc_count INTEGER);
+
+            CREATE TABLE IF NOT EXISTS procs(
+                id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                snap_id   INTEGER NOT NULL REFERENCES snapshots(id),
+                name      TEXT, pid INTEGER,
+                cpu_pct   REAL, mem_mb REAL, gpu_mb INTEGER, instances INTEGER);
+
+            CREATE INDEX IF NOT EXISTS idx_snap_sess ON snapshots(session_id, id);
+            CREATE INDEX IF NOT EXISTS idx_proc_snap ON procs(snap_id);
+            CREATE INDEX IF NOT EXISTS idx_proc_name ON procs(name);
+        """)
+        conn.commit()
+    except Exception as exc:
+        _die(f"DB init failed: {exc}\n{traceback.format_exc()}")
+
+
+def start_session(conn: sqlite3.Connection) -> int:
+    import getpass, socket
+    try:    user = getpass.getuser()
+    except: user = os.environ.get("USERNAME", os.environ.get("USER", "?"))
+    try:    host = socket.gethostname()
+    except: host = "?"
+    cur = conn.execute(
+        "INSERT INTO sessions(user,host,os,py) VALUES(?,?,?,?)",
+        (user, host, platform.platform(), sys.version.split()[0]))
+    conn.commit()
+    log.info("Session started: %s@%s", user, host)
+    return cur.lastrowid
+
+
+def prune(conn: sqlite3.Connection, sid: int) -> None:
+    """Delete the oldest snapshots to keep the DB within MAX_SNAPSHOTS rows."""
+    try:
+        n = conn.execute(
+            "SELECT COUNT(*) FROM snapshots WHERE session_id=?", (sid,)
+        ).fetchone()[0]
+        if n <= MAX_SNAPSHOTS:
+            return
+        rm = n - MAX_SNAPSHOTS
+        # SQLite max variables = 999; chunk if needed
+        chunk = 900
+        offset = 0
+        deleted = 0
+        while deleted < rm:
+            count = min(chunk, rm - deleted)
+            ids = [r[0] for r in conn.execute(
+                "SELECT id FROM snapshots WHERE session_id=? "
+                "ORDER BY id ASC LIMIT ? OFFSET ?",
+                (sid, count, offset)).fetchall()]
+            if not ids:
+                break
+            ph = ",".join("?" * len(ids))
+            conn.execute(f"DELETE FROM procs     WHERE snap_id IN ({ph})", ids)
+            conn.execute(f"DELETE FROM snapshots WHERE id      IN ({ph})", ids)
+            conn.commit()
+            deleted += len(ids)
+        log.debug("Pruned %d old snapshots.", deleted)
+    except Exception as exc:
+        log.error("Prune failed: %s\n%s", exc, traceback.format_exc())
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Batch write buffer
+# ─────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class _PendingRow:
+    """One snapshot row + its proc rows, waiting to be committed."""
+    snap_vals: tuple
+    proc_rows: List[tuple]
+
+
+_db_buffer:       List[_PendingRow] = []
+_db_flush_fails:  int = 0            # consecutive flush failures
+_RECOVERY_PATH:   Path = _DIR_CACHE / "db_recovery.json"
+
+
+def write_snap(conn: sqlite3.Connection, sid: int,
+               s: "Snapshot", cycle: int) -> Optional[int]:
+    """
+    Stage one snapshot into the write buffer.
+    Flushes to SQLite every COMMIT_EVERY cycles.
+    When the buffer reaches _DB_BUFFER_CAP, forces an immediate flush
+    regardless of cycle count to prevent unbounded RAM growth.
+    """
+    global _db_buffer
+
+    g0    = s.gpus[0] if s.gpus else GpuInfo()
+    has_g = bool(s.gpus)
+
+    snap_vals = (
+        sid, s.ts,
+        s.cpu.total_pct, s.cpu.freq_mhz, s.cpu.temp_c,
+        s.ram.used_pct,  s.ram.used_mb,  s.ram.total_mb, s.ram.swap_pct,
+        g0.load_pct  if has_g else None,
+        g0.mem_pct   if has_g else None,
+        g0.temp_c    if has_g else None,
+        s.net.speed_tx_kb, s.net.speed_rx_kb,
+        s.disk.used_pct,   s.disk.read_mb_s,  s.disk.write_mb_s,
+        len(s.procs),
+    )
+    proc_rows = [
+        (nm, e.pid, e.cpu, e.mem_mb, e.gpu_mb, e.instances)
+        for nm, e in s.procs.items()
+    ]
+    _db_buffer.append(_PendingRow(snap_vals=snap_vals, proc_rows=proc_rows))
+
+    # Force flush when cap is reached to prevent unbounded growth
+    force = len(_db_buffer) >= _DB_BUFFER_CAP
+    if force or (cycle % COMMIT_EVERY == 0):
+        if force:
+            log.debug("DB buffer cap hit (%d rows) — forcing flush.", len(_db_buffer))
+        return _flush_db_buffer(conn)
+    return None
+
+
+def _flush_db_buffer(conn: sqlite3.Connection) -> Optional[int]:
+    """
+    Commit all buffered rows in a single transaction.
+
+    On failure:
+      - Rows are written to a recovery JSON file so they survive a crash
+      - _db_flush_fails counter is incremented for health tracking
+      - Buffer is cleared regardless so it cannot grow without bound
+    Returns the last inserted snap_id, or None on empty/error.
+    """
+    global _db_buffer, _db_flush_fails
+
+    if not _db_buffer:
+        return None
+
+    rows_to_flush = _db_buffer
+    _db_buffer    = []
+    last_snap_id: Optional[int] = None
+
+    try:
+        with conn:   # BEGIN ... COMMIT (or ROLLBACK on exception)
+            for row in rows_to_flush:
+                cur = conn.execute(
+                    "INSERT INTO snapshots"
+                    "(session_id,ts,cpu_pct,cpu_freq,cpu_temp,"
+                    " ram_pct,ram_used,ram_total,swap_pct,"
+                    " gpu0_load,gpu0_mem_pct,gpu0_temp,"
+                    " net_tx_kb,net_rx_kb,disk_pct,disk_rd_mbs,disk_wr_mbs,proc_count)"
+                    " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    row.snap_vals,
+                )
+                snap_id      = cur.lastrowid
+                last_snap_id = snap_id
+                conn.executemany(
+                    "INSERT INTO procs(snap_id,name,pid,cpu_pct,mem_mb,gpu_mb,instances)"
+                    " VALUES(?,?,?,?,?,?,?)",
+                    [(snap_id, r[0], r[1], r[2], r[3], r[4], r[5])
+                     for r in row.proc_rows],
+                )
+        _cache.drop("data")
+        _db_flush_fails = 0
+        log.debug("DB flush: committed %d row(s).", len(rows_to_flush))
+        storage_health.record_success()
+
+    except Exception as exc:
+        _db_flush_fails += 1
+        log.error(
+            "DB flush failed (attempt %d, %d rows): %s\n%s",
+            _db_flush_fails, len(rows_to_flush), exc, traceback.format_exc(),
+        )
+        storage_health.record_failure()
+        # Persist rows to recovery file so they survive a crash
+        _write_db_recovery(rows_to_flush)
+        return None
+
+    return last_snap_id
+
+
+def _write_db_recovery(rows: List[_PendingRow]) -> None:
+    """
+    Write buffered rows to a recovery JSON file when the DB flush fails.
+    The recovery file accumulates across failures and is read on next startup.
+    This prevents data loss on temporary disk issues.
+    """
+    try:
+        existing: List[Dict] = []
+        if _RECOVERY_PATH.exists():
+            try:
+                existing = json.loads(_RECOVERY_PATH.read_text(encoding="utf-8"))
+                if not isinstance(existing, list):
+                    existing = []
+            except Exception:
+                existing = []
+
+        new_entries = [
+            {"snap": list(r.snap_vals), "procs": r.proc_rows}
+            for r in rows
+        ]
+        combined = existing + new_entries
+        _atomic_write_text(
+            _RECOVERY_PATH,
+            json.dumps(combined, ensure_ascii=False, default=str),
+        )
+        log.warning("DB recovery: %d row(s) saved to %s", len(rows), _RECOVERY_PATH)
+    except Exception as exc:
+        log.debug("DB recovery write failed: %s", exc)
+
+
+def flush_db_buffer(conn: sqlite3.Connection) -> None:
+    """Public flush hook — call on graceful shutdown to drain the buffer."""
+    _flush_db_buffer(conn)
+    # Also run a WAL checkpoint so the DB file is compact on next open
+    _wal_checkpoint(conn)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 18 -- DATA BUILDER
+#
+#  build_data() assembles the full JSON payload for the SPA dashboard.
+#  It is cached with TTL and invalidated on every successful DB flush.
+#
+#  enrich_live() injects fields that are not in the DB:
+#    - net.iface, net.ssid, net.signal_dbm, net.all_ifaces
+#    - disk.total_gb, disk.free_gb, disk.partitions
+#    - cpu.per_core, cpu.freq_mhz, cpu.temp_c, cpu.phys, cpu.logi
+#    - ram.avail_mb, ram.swap_total_mb, ram.swap_used_mb
+#  Called by the renderer thread before writing data.json.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def build_data(conn: sqlite3.Connection, sid: int) -> Optional[Dict[str, Any]]:
+    cached = _cache.get("data")
+    if cached:
+        return cached
+    try:
+        row = conn.execute(
+            "SELECT id,ts,cpu_pct,cpu_freq,cpu_temp,"
+            "ram_pct,ram_used,ram_total,swap_pct,"
+            "gpu0_load,gpu0_mem_pct,gpu0_temp,"
+            "net_tx_kb,net_rx_kb,disk_pct,disk_rd_mbs,disk_wr_mbs,proc_count "
+            "FROM snapshots WHERE session_id=? ORDER BY id DESC LIMIT 1",
+            (sid,)).fetchone()
+        if not row:
+            return None
+
+        (snap_id, ts,
+         cpu_pct, cpu_freq, cpu_temp,
+         ram_pct, ram_used, ram_tot, swap_pct,
+         g_load, g_mem, g_temp,
+         net_tx, net_rx,
+         d_pct, d_rd, d_wr, pc) = row
+
+        hist = list(reversed(conn.execute(
+            "SELECT ts,cpu_pct,ram_pct,gpu0_load,"
+            "net_tx_kb,net_rx_kb,disk_pct,disk_rd_mbs,disk_wr_mbs,cpu_temp,cpu_freq "
+            "FROM snapshots WHERE session_id=? ORDER BY id DESC LIMIT ?",
+            (sid, CHART_POINTS)).fetchall()))
+
+        sr = conn.execute(
+            "SELECT MAX(cpu_pct),AVG(cpu_pct),"
+            "MAX(ram_pct),AVG(ram_pct),"
+            "MAX(gpu0_load),MAX(net_tx_kb),MAX(net_rx_kb),COUNT(*) "
+            "FROM snapshots WHERE session_id=?", (sid,)).fetchone()
+        mk_cpu, av_cpu, mk_ram, av_ram, mk_gpu, mk_tx, mk_rx, total = sr
+
+        sess = conn.execute(
+            "SELECT user,host,os,py,started_at FROM sessions WHERE id=?",
+            (sid,)).fetchone()
+        user, host, os_str, pyver, started = sess
+
+        uptime = 0
+        try:
+            uptime = int((dt.datetime.now() -
+                          dt.datetime.fromisoformat(started)).total_seconds())
+        except Exception:
+            pass
+
+        top_cpu = conn.execute(
+            "SELECT name,cpu_pct,mem_mb,gpu_mb,instances FROM procs "
+            "WHERE snap_id=? ORDER BY cpu_pct DESC LIMIT ?",
+            (snap_id, TOP_N)).fetchall()
+        top_ram = conn.execute(
+            "SELECT name,mem_mb,cpu_pct,gpu_mb,instances FROM procs "
+            "WHERE snap_id=? ORDER BY mem_mb DESC LIMIT ?",
+            (snap_id, TOP_N)).fetchall()
+        top_gpu = conn.execute(
+            "SELECT name,gpu_mb,cpu_pct,mem_mb,instances FROM procs "
+            "WHERE snap_id=? AND gpu_mb>0 ORDER BY gpu_mb DESC LIMIT ?",
+            (snap_id, TOP_N)).fetchall()
+        all_p = conn.execute(
+            "SELECT name,pid,cpu_pct,mem_mb,gpu_mb,instances FROM procs "
+            "WHERE snap_id=? ORDER BY name COLLATE NOCASE",
+            (snap_id,)).fetchall()
+
+        def _rng(vals: List) -> List[float]:
+            v = [x for x in vals if x is not None]
+            if not v:
+                return [0.0, 100.0]
+            return [round(max(0.0, min(v) - 5), 1),
+                    round(min(100.0, max(v) + 10), 1)]
+
+        net_peak = max(
+            float(mk_tx or 0), float(mk_rx or 0),
+            float(net_tx or 0), float(net_rx or 0), 1.0
+        ) * 1.2
+
+        result: Dict[str, Any] = {
+            "ts": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "session": {
+                "user": user, "host": host, "os": os_str, "py": pyver,
+                "started": started, "db": DB_PATH,
+                "base_dir": str(BASE_DIR),
+                "storage_ok": storage_health.is_healthy(),
+                "disk_free_mb": round(storage_health.available_mb(), 1),
+            },
+            "cpu": {
+                "now":      round(cpu_pct  or 0, 1),
+                "peak":     round(mk_cpu   or 0, 1),
+                "avg":      round(av_cpu   or 0, 1),
+                "freq_mhz": round(cpu_freq or 0, 0),
+                "temp_c":   round(cpu_temp or 0, 1),
+                "top":      [{"name": r[0], "cpu": r[1] or 0, "mem_mb": r[2] or 0,
+                              "gpu_mb": r[3] or 0, "inst": r[4] or 1}
+                             for r in top_cpu],
+            },
+            "ram": {
+                "pct":      round(ram_pct  or 0, 1),
+                "used_mb":  ram_used or 0,
+                "total_mb": ram_tot  or 0,
+                "peak":     round(mk_ram   or 0, 1),
+                "avg":      round(av_ram   or 0, 1),
+                "swap_pct": round(swap_pct or 0, 1),
+                "top":      [{"name": r[0], "mem_mb": r[1] or 0, "cpu": r[2] or 0,
+                               "gpu_mb": r[3] or 0, "inst": r[4] or 1}
+                              for r in top_ram],
+            },
+            "gpu": {
+                "available": g_load is not None,
+                "backend":   _gpu_backend or "none",
+                "load":      round(g_load or 0, 1) if g_load is not None else None,
+                "mem_pct":   round(g_mem  or 0, 1) if g_mem  is not None else None,
+                "temp_c":    round(g_temp or 0, 1) if g_temp is not None else None,
+                "peak":      round(mk_gpu or 0, 1) if mk_gpu is not None else None,
+                "top":       [{"name": r[0], "gpu_mb": r[1] or 0, "cpu": r[2] or 0,
+                                "mem_mb": r[3] or 0, "inst": r[4] or 1}
+                               for r in top_gpu],
+            },
+            "net": {
+                "tx_kb":   round(net_tx or 0, 1),
+                "rx_kb":   round(net_rx or 0, 1),
+                "peak_tx": round(mk_tx  or 0, 1),
+                "peak_rx": round(mk_rx  or 0, 1),
+                "iface": "", "ssid": "", "signal_dbm": None, "all_ifaces": [],
+            },
+            "disk": {
+                "path":      DISK_PATH,
+                "used_pct":  round(d_pct or 0, 1),
+                "read_mbs":  round(d_rd  or 0, 2),
+                "write_mbs": round(d_wr  or 0, 2),
+                "total_gb": 0.0, "used_gb": 0.0, "free_gb": 0.0,
+                "partitions": [],
+            },
+            "all_procs": [{"name": r[0], "pid": r[1], "cpu": r[2] or 0,
+                           "mem_mb": r[3] or 0, "gpu_mb": r[4] or 0,
+                           "inst": r[5] or 1} for r in all_p],
+            "procs":  pc or 0,
+            "snaps":  total or 0,
+            "uptime": uptime,
+            "history": [
+                {
+                    "ts":   r[0][11:19],
+                    "cpu":  round(r[1] or 0, 1),
+                    "ram":  round(r[2] or 0, 1),
+                    "gpu":  round(r[3] or 0, 1) if r[3] is not None else None,
+                    "tx":   round(r[4] or 0, 1),
+                    "rx":   round(r[5] or 0, 1),
+                    "dpct": round(r[6] or 0, 1),
+                    "drd":  round(r[7] or 0, 2),
+                    "dwr":  round(r[8] or 0, 2),
+                    "temp": round(r[9]  or 0, 1) if r[9]  else None,
+                    "freq": round(r[10] or 0, 0) if r[10] else None,
+                }
+                for r in hist
+            ],
+            "ranges": {
+                "cpu":  _rng([r[1] for r in hist]),
+                "ram":  _rng([r[2] for r in hist]),
+                "gpu":  _rng([r[3] for r in hist]),
+                "net":  [0.0, round(net_peak, 1)],
+                "disk": _rng([r[6] for r in hist]),
+            },
+        }
+        _cache.set("data", result)
+        return result
+
+    except Exception as exc:
+        log.error("build_data: %s\n%s", exc, traceback.format_exc())
+        return None
+
+
+def enrich_live(data: Dict[str, Any], snap: "Snapshot") -> None:
+    """
+    Inject non-DB live fields from the latest Snapshot.
+    Uses targeted key updates instead of dict.update to avoid accidentally
+    clobbering DB-sourced values if key names ever overlap.
+    """
+    # Network
+    try:
+        n = snap.net
+        data["net"]["iface"]      = n.iface
+        data["net"]["ssid"]       = n.ssid
+        data["net"]["signal_dbm"] = n.signal_dbm
+        data["net"]["all_ifaces"] = n.all_ifaces
+    except Exception as exc:
+        log.debug("enrich_live net: %s", exc)
+
+    # Disk partitions + live usage
+    try:
+        d = snap.disk
+        data["disk"]["total_gb"]   = d.total_gb
+        data["disk"]["used_gb"]    = d.used_gb
+        data["disk"]["free_gb"]    = d.free_gb
+        data["disk"]["partitions"] = [
+            {
+                "device":     p.device,
+                "mountpoint": p.mountpoint,
+                "fstype":     p.fstype,
+                "total_gb":   p.total_gb,
+                "used_gb":    p.used_gb,
+                "free_gb":    p.free_gb,
+                "used_pct":   p.used_pct,
+            }
+            for p in d.partitions
+        ]
+    except Exception as exc:
+        log.debug("enrich_live disk: %s", exc)
+
+    # CPU per-core + live freq/temp
+    try:
+        data["cpu"]["per_core"] = snap.cpu.per_core
+        data["cpu"]["freq_mhz"] = snap.cpu.freq_mhz
+        data["cpu"]["temp_c"]   = snap.cpu.temp_c
+        data["cpu"]["phys"]     = snap.cpu.physical_cores
+        data["cpu"]["logi"]     = snap.cpu.logical_cores
+    except Exception as exc:
+        log.debug("enrich_live cpu: %s", exc)
+
+    # RAM swap detail
+    try:
+        data["ram"]["swap_total_mb"] = snap.ram.swap_total
+        data["ram"]["swap_used_mb"]  = snap.ram.swap_used
+        data["ram"]["avail_mb"]      = snap.ram.avail_mb
+    except Exception as exc:
+        log.debug("enrich_live ram: %s", exc)
+
+    # Live storage health status
+    try:
+        data["session"]["storage_ok"]    = storage_health.is_healthy()
+        data["session"]["disk_free_mb"]  = round(storage_health.available_mb(), 1)
+    except Exception:
+        pass
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 19 -- DATA.JSON WRITER + SNAPSHOT RING + EXPORT + SPA HTML
+#
+#  Four storage surfaces
+#  =====================
+#  A. data.json        Live SPA feed; delta-guarded, compact JSON, no indent
+#  B. Snapshot ring    Timestamped files in data/snapshots/; gzip optional;
+#                      auto-pruned to SNAPSHOT_KEEP; history excluded to save space
+#  C. Export           On-demand full CSV + JSON in data/exports/
+#  D. dashboard.html   Written once at startup via write_spa_html()
+#
+#  All writes go through _atomic_write_text/_bytes (write-tmp-then-replace).
+#  StorageHealth gates writes: if is_healthy() is False, skips are logged.
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  A. data.json — delta-guarded live feed
+#
+#  Delta sentinel covers: cpu, ram, gpu, procs, disk_pct, net_tx
+#  so any meaningful metric change triggers a write.
+#  Compact JSON (no indent, no spaces) reduces file size by ~40%.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_last_data_sig: str = ""   # signature of last written payload
+
+
+def _build_data_sig(data: Dict[str, Any]) -> str:
+    """
+    Build a compact change-detection signature from the most volatile fields.
+    If this signature is identical to the last write, the write is skipped.
+    """
+    try:
+        cpu     = round(float(data.get("cpu",  {}).get("now",    0)), 1)
+        ram     = round(float(data.get("ram",  {}).get("pct",    0)), 1)
+        gpu     = round(float(data.get("gpu",  {}).get("load") or 0), 1)
+        procs   = int(        data.get("procs",  0))
+        snaps   = int(        data.get("snaps",  0))
+        disk    = round(float(data.get("disk",  {}).get("used_pct", 0)), 1)
+        net_tx  = round(float(data.get("net",   {}).get("tx_kb",  0)), 1)
+        return f"{cpu}|{ram}|{gpu}|{procs}|{snaps}|{disk}|{net_tx}"
+    except Exception:
+        return ""   # empty sig → always write
+
+
+def write_json_data(data: Dict[str, Any]) -> bool:
+    """
+    Atomically write the live data.json payload to data/cache/.
+
+    Delta guard: computes a multi-metric signature; if nothing meaningful
+    changed since the last write, the write is skipped to reduce disk I/O.
+    Storage health gate: if the disk is critically full, skips the write.
+
+    Returns True when a write was performed, False when skipped or failed.
+    """
+    global _last_data_sig
+
+    if not storage_health.is_healthy():
+        log.debug("write_json_data skipped: storage unhealthy.")
+        return False
+
+    sig = _build_data_sig(data)
+    if sig and sig == _last_data_sig:
+        return False   # nothing meaningful changed
+
+    try:
+        payload = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+    except Exception as exc:
+        log.debug("write_json_data serialise: %s", exc)
+        return False
+
+    dest = Path(JSON_DATA_PATH)
+    if _atomic_write_text(dest, payload):
+        _last_data_sig = sig
+        storage_health.record_success()
+        return True
+
+    storage_health.record_failure()
+    return False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  B. Snapshot ring — timestamped JSON files in data/snapshots/
+#
+#  Filename encodes the timestamp for lexicographic ordering:
+#    snap_20250714T223105_000042.json[.gz]
+#    (timestamp + monotonic counter prevents collisions on fast cycles)
+#  Ring is pruned automatically after every write.
+#  Both .json and .json.gz are handled when listing/pruning so changing
+#  snapshot_compress mid-run doesn't leave orphan files invisible.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_snap_seq: int = 0   # monotonic sequence counter for unique filenames
+
+
+def _snapshot_filename(ts: str) -> str:
+    """
+    Build a sortable, unique snapshot filename.
+    '2025-07-14T22:31:05' + seq=42 → 'snap_20250714T223105_000042.json[.gz]'
+    """
+    global _snap_seq
+    _snap_seq += 1
+    safe = ts.replace(":", "").replace("-", "").replace(" ", "T")
+    ext  = ".json.gz" if SNAPSHOT_COMPRESS else ".json"
+    return f"snap_{safe}_{_snap_seq:06d}{ext}"
+
+
+def write_snapshot_file(data: Dict[str, Any]) -> Optional[Path]:
+    """
+    Write one snapshot to the ring directory.
+    Excludes the 'history' array (already in DB) to reduce file size.
+    Returns the written Path on success, None on failure.
+    Auto-prunes the ring after each write.
+    """
+    if not storage_health.is_healthy():
+        return None
+
+    ts   = data.get("ts", dt.datetime.now().strftime("%Y-%m-%dT%H:%M:%S"))
+    name = _snapshot_filename(ts)
+    dest = _DIR_SNAPSHOTS / name
+
+    try:
+        # Slim payload: omit 'history' (verbose, already persisted in DB)
+        slim = {k: v for k, v in data.items() if k != "history"}
+        raw  = json.dumps(slim, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        body = gzip.compress(raw, compresslevel=6) if SNAPSHOT_COMPRESS else raw
+
+        if _atomic_write_bytes(dest, body):
+            storage_health.record_success()
+            _prune_snapshot_ring()
+            return dest
+        storage_health.record_failure()
+    except Exception as exc:
+        log.debug("write_snapshot_file %s: %s", name, exc)
+    return None
+
+
+def _prune_snapshot_ring() -> None:
+    """
+    Delete oldest snapshot files when the ring exceeds SNAPSHOT_KEEP.
+    Globs BOTH .json and .json.gz so mixed-mode rings prune correctly
+    (e.g. after changing snapshot_compress in config).
+    """
+    try:
+        files = sorted(
+            list(_DIR_SNAPSHOTS.glob("snap_*.json")) +
+            list(_DIR_SNAPSHOTS.glob("snap_*.json.gz"))
+        )
+        excess = len(files) - SNAPSHOT_KEEP
+        if excess <= 0:
+            return
+        for old in files[:excess]:
+            try:
+                old.unlink()
+            except OSError as exc:
+                log.debug("prune snapshot %s: %s", old.name, exc)
+        log.debug("Snapshot ring pruned %d file(s) (kept %d).", excess, SNAPSHOT_KEEP)
+    except Exception as exc:
+        log.debug("_prune_snapshot_ring: %s", exc)
+
+
+def read_snapshot_file(path: Path) -> Optional[Dict[str, Any]]:
+    """
+    Read and decompress a snapshot file.
+    Supports both .json and .json.gz regardless of current SNAPSHOT_COMPRESS.
+    Returns None on any error.
+    """
+    try:
+        raw = path.read_bytes()
+        # Detect gzip by magic bytes (1f 8b) rather than extension
+        if raw[:2] == b"\x1f\x8b":
+            raw = gzip.decompress(raw)
+        return json.loads(raw.decode("utf-8"))
+    except Exception as exc:
+        log.debug("read_snapshot_file %s: %s", path.name, exc)
+        return None
+
+
+def list_snapshots() -> List[Path]:
+    """
+    Return all snapshot files sorted oldest-first.
+    Handles both .json and .json.gz so listing is always complete.
+    """
+    try:
+        return sorted(
+            list(_DIR_SNAPSHOTS.glob("snap_*.json")) +
+            list(_DIR_SNAPSHOTS.glob("snap_*.json.gz"))
+        )
+    except Exception:
+        return []
+
+
+def get_snapshot_ring_stats() -> Dict[str, Any]:
+    """Return a summary of the snapshot ring for dashboard/debug use."""
+    files = list_snapshots()
+    total_bytes = 0
+    for f in files:
+        try:
+            total_bytes += f.stat().st_size
+        except OSError:
+            pass
+    return {
+        "count":        len(files),
+        "keep":         SNAPSHOT_KEEP,
+        "compressed":   SNAPSHOT_COMPRESS,
+        "total_kb":     round(total_bytes / 1024, 1),
+        "oldest":       files[0].name  if files else None,
+        "newest":       files[-1].name if files else None,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  C. Export — on-demand CSV + JSON in data/exports/
+# ─────────────────────────────────────────────────────────────────────────────
+
+def do_export(conn: sqlite3.Connection, sid: int) -> Tuple[str, str]:
+    """
+    Write a full session export to data/exports/ and return (csv_path, json_path).
+    Uses atomic writes; logs errors but always returns valid path strings
+    so the caller can display them regardless of whether writes succeeded.
+    JSON is capped at EXPORT_JSON_MAX_ROWS (most recent rows) to stay manageable.
+    """
+    ts    = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    csv_p = _DIR_EXPORTS / f"snapshots_{ts}.csv"
+    jso_p = _DIR_EXPORTS / f"snapshots_{ts}.json"
+
+    cols = [
+        "ts", "cpu_pct", "ram_pct", "ram_used_mb", "ram_total_mb",
+        "gpu0_load", "net_tx_kb", "net_rx_kb", "disk_pct",
+        "disk_rd_mbs", "disk_wr_mbs", "cpu_temp_c", "cpu_freq_mhz",
+        "swap_pct", "proc_count",
+    ]
+
+    # DB query
+    try:
+        rows = conn.execute(
+            "SELECT ts,cpu_pct,ram_pct,ram_used,ram_total,"
+            "gpu0_load,net_tx_kb,net_rx_kb,disk_pct,disk_rd_mbs,disk_wr_mbs,"
+            "cpu_temp,cpu_freq,swap_pct,proc_count "
+            "FROM snapshots WHERE session_id=? ORDER BY id ASC", (sid,)
+        ).fetchall()
+    except Exception as exc:
+        log.error("Export DB query failed: %s", exc)
+        return str(csv_p), str(jso_p)
+
+    # CSV — build in memory, write atomically
+    buf = _io.StringIO()
+    w   = csv.writer(buf)
+    w.writerow(cols)
+    w.writerows(rows)
+    ok_csv = _atomic_write_text(csv_p, buf.getvalue())
+    if ok_csv:
+        storage_health.record_success()
+
+    # JSON — cap rows, write atomically
+    tail = rows[-EXPORT_JSON_MAX_ROWS:]
+    ok_json = _atomic_write_text(
+        jso_p,
+        json.dumps(
+            [dict(zip(cols, r)) for r in tail],
+            indent=2, ensure_ascii=False,
+        ),
+    )
+    if ok_json:
+        storage_health.record_success()
+
+    log.info(
+        "Export: %s rows total, %d in JSON, csv=%s json=%s",
+        len(rows), len(tail),
+        "OK" if ok_csv else "FAIL", "OK" if ok_json else "FAIL",
+    )
+    return str(csv_p), str(jso_p)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  D. SPA HTML shell — written once at startup
+# ─────────────────────────────────────────────────────────────────────────────
+
+def write_spa_html() -> None:
+    """
+    Render and atomically write the SPA HTML shell to data/cache/.
+    The live dashboard data is served by data.json; this file is static.
+    Skips re-writing if the file already exists with the correct interval.
+    """
+    dest = Path(HTML_PATH)
+    html = _SPA_HTML.replace("__INTERVAL__", str(INTERVAL_SEC))
+
+    # Skip if file is already up-to-date (avoids unnecessary write on restart)
+    try:
+        if dest.exists() and f"setInterval(poll, {INTERVAL_SEC}" in dest.read_text(encoding="utf-8"):
+            log.debug("SPA dashboard already current — skipping write.")
+            return
+    except OSError:
+        pass
+
+    if _atomic_write_text(dest, html):
+        log.info("SPA dashboard written: %s", dest)
+        storage_health.record_success()
+    else:
+        log.error("Failed to write SPA dashboard: %s", dest)
+        storage_health.record_failure()
+
+_SPA_HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Activity Monitor</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700&family=Syne:wght@600;700;800&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
+<style>
+/* ── Reset & Variables ─────────────────────────────────────────────────── */
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:      #07090f;
+  --s1:      #0b1018;
+  --s2:      #111928;
+  --s3:      #162030;
+  --border:  #1c2a42;
+  --border2: #243550;
+  --c1: #00e5ff; /* cyan  – CPU */
+  --c2: #ff6b35; /* coral – RAM */
+  --c3: #7fff7f; /* green – active/ok */
+  --c4: #bd93f9; /* purple– GPU */
+  --c5: #f1fa8c; /* yellow– storage */
+  --c6: #ff79c6; /* pink  – write */
+  --c7: #8be9fd; /* sky   – network */
+  --cr: #ff5555; /* red   – warning */
+  --text:  #cdd6f4;
+  --muted: #4a6080;
+  --dim:   #2a3f5f;
+  --white: #e8eaf6;
+  --r:     10px;
+  --r-sm:  6px;
+  --mono:  'JetBrains Mono', monospace;
+  --head:  'Syne', sans-serif;
+  --transition: 180ms ease;
+}
+html{ background:var(--bg); scroll-behavior:smooth }
+body{
+  font-family:var(--mono);
+  font-size:13px;
+  line-height:1.6;
+  color:var(--text);
+  min-height:100vh;
+  background:
+    radial-gradient(ellipse 120% 50% at 50% -5%, rgba(0,229,255,.05) 0%, transparent 65%),
+    radial-gradient(ellipse 50% 35% at 90% 85%,  rgba(189,147,249,.04) 0%, transparent 55%),
+    var(--bg);
+}
+
+/* ── Scrollbar ─────────────────────────────────────────────────────────── */
+::-webkit-scrollbar{ width:6px; height:6px }
+::-webkit-scrollbar-track{ background:var(--s1) }
+::-webkit-scrollbar-thumb{ background:var(--dim); border-radius:3px }
+::-webkit-scrollbar-thumb:hover{ background:var(--border2) }
+
+/* ── Header ────────────────────────────────────────────────────────────── */
+header{
+  display:flex; align-items:center; justify-content:space-between;
+  flex-wrap:wrap; gap:10px;
+  padding:13px 24px;
+  border-bottom:1px solid var(--border);
+  background:rgba(7,9,15,.92);
+  backdrop-filter:blur(16px);
+  position:sticky; top:0; z-index:400;
+}
+.hlogo{ display:flex; align-items:center; gap:12px }
+.hpulse{
+  width:9px; height:9px; border-radius:50%;
+  background:var(--c3); box-shadow:0 0 8px var(--c3);
+  animation:pulse 2.2s ease infinite;
+  flex-shrink:0;
+}
+.hpulse.error{ background:var(--cr); box-shadow:0 0 8px var(--cr) }
+@keyframes pulse{
+  0%,100%{ opacity:1; box-shadow:0 0 8px currentColor }
+  50%{     opacity:.25; box-shadow:none }
+}
+h1{
+  font-family:var(--head);
+  font-size:15px; font-weight:800;
+  color:var(--white); letter-spacing:.07em;
+}
+.hsub{ font-size:10px; color:var(--muted); margin-top:1px }
+.hbadges{ display:flex; align-items:center; gap:8px; flex-wrap:wrap }
+.badge{
+  font-size:10px; color:var(--muted);
+  border:1px solid var(--border);
+  border-radius:20px; padding:3px 10px;
+  white-space:nowrap;
+}
+.badge b{ color:var(--c1) }
+.badge.warn{ border-color:rgba(255,85,85,.4); color:var(--cr) }
+.badge.ok  { border-color:rgba(127,255,127,.3); color:var(--c3) }
+
+/* ── Tabs ──────────────────────────────────────────────────────────────── */
+.tabbar{
+  display:flex; gap:0;
+  padding:0 20px;
+  background:rgba(7,9,15,.6);
+  border-bottom:1px solid var(--border);
+  overflow-x:auto;
+  -webkit-overflow-scrolling:touch;
+  scrollbar-width:none;
+}
+.tabbar::-webkit-scrollbar{ display:none }
+.tab{
+  padding:10px 20px;
+  font:600 11px/1 var(--mono);
+  letter-spacing:.08em;
+  text-transform:uppercase;
+  color:var(--muted);
+  background:none; border:none;
+  border-bottom:2px solid transparent;
+  cursor:pointer;
+  white-space:nowrap;
+  transition:color var(--transition), border-color var(--transition);
+}
+.tab:hover{ color:var(--text) }
+.tab.active{ color:var(--c1); border-bottom-color:var(--c1) }
+.tab-gpu.active  { color:var(--c4); border-bottom-color:var(--c4) }
+.tab-cpu.active  { color:var(--c1); border-bottom-color:var(--c1) }
+.tab-ram.active  { color:var(--c2); border-bottom-color:var(--c2) }
+.tab-net.active  { color:var(--c7); border-bottom-color:var(--c7) }
+.tab-disk.active { color:var(--c5); border-bottom-color:var(--c5) }
+
+/* ── Layout ────────────────────────────────────────────────────────────── */
+main{ padding:20px 24px; max-width:1700px; margin:0 auto }
+.panel{ display:none }
+.panel.active{ display:block }
+.section-title{
+  font-family:var(--head); font-size:10px; font-weight:700;
+  color:var(--muted); letter-spacing:.15em; text-transform:uppercase;
+  margin:0 0 12px;
+  display:flex; align-items:center; gap:8px;
+}
+.section-title::after{
+  content:''; flex:1; height:1px; background:var(--border)
+}
+
+/* ── Metric Cards ──────────────────────────────────────────────────────── */
+.cards{
+  display:grid;
+  grid-template-columns:repeat(auto-fill, minmax(148px,1fr));
+  gap:10px; margin-bottom:20px;
+}
+.card{
+  background:var(--s1);
+  border:1px solid var(--border);
+  border-radius:var(--r);
+  padding:14px 15px;
+  position:relative; overflow:hidden;
+  transition:border-color var(--transition);
+}
+.card:hover{ border-color:var(--border2) }
+.card::after{
+  content:'';
+  position:absolute; inset:0;
+  background:linear-gradient(135deg,rgba(255,255,255,.018) 0%,transparent 55%);
+  pointer-events:none; border-radius:var(--r);
+}
+.card-accent{
+  position:absolute; top:0; left:0; right:0;
+  height:2px; border-radius:var(--r) var(--r) 0 0;
+}
+.card-label{
+  font-size:9px; color:var(--muted);
+  letter-spacing:.13em; text-transform:uppercase;
+  margin-bottom:6px;
+}
+.card-value{
+  font-family:var(--head);
+  font-size:28px; font-weight:800;
+  color:var(--white); line-height:1;
+}
+.card-unit{
+  font-size:11px; color:var(--muted);
+  font-family:var(--mono); font-weight:400;
+}
+.card-sub{ font-size:10px; color:var(--muted); margin-top:5px }
+.card-sub b{ color:var(--text); font-weight:500 }
+.gbar-wrap{
+  margin-top:8px; height:3px;
+  background:var(--border); border-radius:2px; overflow:hidden;
+}
+.gbar{
+  height:100%; border-radius:2px;
+  transition:width var(--transition);
+}
+
+/* ── Charts ────────────────────────────────────────────────────────────── */
+.charts{
+  display:grid;
+  grid-template-columns:repeat(auto-fill, minmax(300px,1fr));
+  gap:14px; margin-bottom:20px;
+}
+.chart-box{
+  background:var(--s1);
+  border:1px solid var(--border);
+  border-radius:var(--r);
+  padding:16px 16px 10px;
+}
+.chart-hdr{
+  display:flex; justify-content:space-between; align-items:center;
+  margin-bottom:10px;
+}
+.chart-title{
+  font-family:var(--head); font-size:11px; font-weight:700;
+  color:var(--white);
+}
+.chart-meta{ font-size:10px; color:var(--muted) }
+.chart-meta b{ font-weight:600 }
+.chart-wrap{ position:relative; height:130px }
+
+/* ── Process Tables ────────────────────────────────────────────────────── */
+.tbl-box{
+  background:var(--s1);
+  border:1px solid var(--border);
+  border-radius:var(--r);
+  padding:14px 16px;
+  margin-bottom:20px;
+  overflow-x:auto;
+}
+.tbl-hdr{
+  display:flex; justify-content:space-between;
+  align-items:center; flex-wrap:wrap; gap:8px;
+  margin-bottom:10px;
+}
+.tbl-title{
+  font-family:var(--head); font-size:11px; font-weight:700;
+  color:var(--white);
+}
+.tbl-count{
+  font-size:10px; color:var(--muted);
+  border:1px solid var(--border);
+  border-radius:12px; padding:2px 9px;
+}
+.search-input{
+  background:var(--s2);
+  border:1px solid var(--border);
+  color:var(--text);
+  border-radius:var(--r-sm);
+  padding:5px 11px;
+  font:12px/1 var(--mono);
+  outline:none; width:180px;
+  transition:border-color var(--transition);
+}
+.search-input:focus{ border-color:var(--c1) }
+.search-input::placeholder{ color:var(--muted) }
+table{ width:100%; border-collapse:collapse }
+thead th{
+  text-align:left; font-size:9px; color:var(--muted);
+  letter-spacing:.1em; text-transform:uppercase;
+  padding:5px 8px;
+  border-bottom:1px solid var(--border);
+  cursor:pointer; user-select:none; white-space:nowrap;
+  transition:color var(--transition);
+}
+thead th:hover{ color:var(--c1) }
+thead th.sort-asc::after { content:' ↑' }
+thead th.sort-desc::after{ content:' ↓' }
+tbody tr{
+  border-bottom:1px solid rgba(28,42,66,.3);
+  transition:background var(--transition);
+}
+tbody tr:last-child{ border-bottom:none }
+tbody tr:hover{ background:rgba(0,229,255,.025) }
+tbody td{
+  padding:4px 8px; font-size:11px; white-space:nowrap;
+  vertical-align:middle;
+}
+.td-name{
+  color:var(--white); max-width:180px;
+  overflow:hidden; text-overflow:ellipsis;
+}
+.td-pid{
+  display:inline-block;
+  background:rgba(0,229,255,.07);
+  border:1px solid rgba(0,229,255,.18);
+  color:var(--c1); border-radius:3px;
+  padding:0 5px; font-size:9px;
+}
+.td-cpu{ color:var(--c1) }
+.td-ram{ color:var(--c2) }
+.td-gpu{ color:var(--c4) }
+.td-muted{ color:var(--muted) }
+.minibar{
+  display:inline-block; vertical-align:middle;
+  margin-left:5px; width:34px; height:3px;
+  background:var(--border); border-radius:2px; overflow:hidden;
+}
+.minibar-fill{ height:100%; border-radius:2px; transition:width .3s }
+.hidden{ display:none!important }
+.na{ color:var(--muted); font-style:italic }
+
+/* ── Network / Wi-Fi cards ─────────────────────────────────────────────── */
+.iface-grid{
+  display:grid;
+  grid-template-columns:repeat(auto-fill, minmax(220px,1fr));
+  gap:10px; margin-bottom:20px;
+}
+.iface-card{
+  background:var(--s1); border:1px solid var(--border);
+  border-radius:var(--r); padding:13px 15px;
+}
+.iface-name{
+  font-family:var(--head); font-size:12px; font-weight:700;
+  color:var(--white); margin-bottom:7px;
+  display:flex; align-items:center; gap:6px;
+}
+.dot-up  { color:var(--c3); font-size:9px }
+.dot-down{ color:var(--cr); font-size:9px }
+.iface-row{
+  display:flex; justify-content:space-between;
+  font-size:10px; color:var(--muted); padding:2px 0;
+}
+.iface-row span{ color:var(--text) }
+
+/* ── Storage / Partition bars ──────────────────────────────────────────── */
+.part-list{ display:flex; flex-direction:column; gap:10px; margin-bottom:20px }
+.part-card{
+  background:var(--s1); border:1px solid var(--border);
+  border-radius:var(--r); padding:13px 16px;
+}
+.part-top{
+  display:flex; justify-content:space-between;
+  align-items:baseline; margin-bottom:7px;
+}
+.part-name{ font-size:12px; font-weight:600; color:var(--white) }
+.part-fstype{
+  font-size:9px; color:var(--muted); margin-left:5px;
+  background:var(--s2); border:1px solid var(--border);
+  border-radius:3px; padding:1px 5px;
+}
+.part-pct{ font-size:12px; color:var(--c5) }
+.part-bar{
+  height:5px; background:var(--border);
+  border-radius:3px; overflow:hidden; margin-bottom:7px;
+}
+.part-bar-fill{ height:100%; border-radius:3px; transition:width .4s }
+.part-meta{
+  display:flex; gap:16px; flex-wrap:wrap;
+}
+.part-meta span{ font-size:10px; color:var(--muted) }
+.part-meta b{ color:var(--text); font-weight:500 }
+
+/* ── Per-core grid ─────────────────────────────────────────────────────── */
+.core-grid{
+  display:grid;
+  grid-template-columns:repeat(auto-fill, minmax(90px,1fr));
+  gap:8px; margin-bottom:20px;
+}
+.core-card{
+  background:var(--s1); border:1px solid var(--border);
+  border-radius:var(--r-sm); padding:9px 11px;
+}
+.core-lbl{ font-size:9px; color:var(--muted); margin-bottom:3px }
+.core-val{
+  font-family:var(--head); font-size:18px; font-weight:800;
+  color:var(--white);
+}
+.core-val .cu{ font-size:11px; color:var(--muted) }
+
+/* ── GPU unavailable banner ────────────────────────────────────────────── */
+.unavail-banner{
+  text-align:center; padding:48px 20px;
+  background:var(--s1); border:1px solid var(--border);
+  border-radius:var(--r); margin-bottom:20px;
+}
+.unavail-banner h2{
+  font-family:var(--head); font-size:18px;
+  color:var(--text); margin-bottom:8px;
+}
+.unavail-banner p{ font-size:12px; color:var(--muted); line-height:1.7 }
+.unavail-banner code{
+  background:var(--s2); border:1px solid var(--border);
+  border-radius:3px; padding:1px 6px; font-size:11px;
+}
+
+/* ── Footer ────────────────────────────────────────────────────────────── */
+footer{
+  text-align:center; padding:14px;
+  font-size:10px; color:var(--muted);
+  border-top:1px solid var(--border);
+  margin-top:4px;
+}
+
+/* ── Responsive ────────────────────────────────────────────────────────── */
+@media(max-width:700px){
+  header{ padding:11px 14px }
+  main  { padding:14px }
+  .tabbar{ padding:0 10px }
+  .tab  { padding:9px 13px }
+}
+</style>
+</head>
+<body>
+
+<!-- ════════════════ HEADER ════════════════ -->
+<header>
+  <div class="hlogo">
+    <div class="hpulse" id="hpulse"></div>
+    <div>
+      <h1>ACTIVITY MONITOR</h1>
+      <div class="hsub" id="h-host">Loading…</div>
+    </div>
+  </div>
+  <div class="hbadges">
+    <span class="badge ok"><span id="h-uptime">—</span></span>
+    <span class="badge">Updated <b id="h-ts">—</b></span>
+    <span class="badge"><b id="h-snaps">—</b> snapshots</span>
+    <span class="badge"><b id="h-procs">—</b> processes</span>
+    <span class="badge" id="h-storage-badge">Storage <b id="h-storage">—</b></span>
+  </div>
+</header>
+
+<!-- ════════════════ TABS ════════════════ -->
+<nav class="tabbar" role="tablist">
+  <button class="tab tab-cpu  active" data-tab="cpu"  role="tab">CPU</button>
+  <button class="tab tab-ram"         data-tab="ram"  role="tab">RAM</button>
+  <button class="tab tab-gpu"         data-tab="gpu"  role="tab">GPU</button>
+  <button class="tab tab-net"         data-tab="net"  role="tab">Wi-Fi</button>
+  <button class="tab tab-disk"        data-tab="disk" role="tab">Storage</button>
+</nav>
+
+<main>
+
+<!-- ════════════════ CPU TAB ════════════════ -->
+<div class="panel active" id="panel-cpu">
+
+  <div class="section-title">Overview</div>
+  <div class="cards">
+    <div class="card">
+      <div class="card-accent" style="background:linear-gradient(90deg,var(--c1),transparent)"></div>
+      <div class="card-label">Total CPU</div>
+      <div class="card-value"><span id="cpu-tot">—</span><span class="card-unit">%</span></div>
+      <div class="gbar-wrap"><div class="gbar" id="cpu-tot-g" style="background:linear-gradient(90deg,var(--c1),#0080ff)"></div></div>
+      <div class="card-sub">Peak <b id="cpu-pk">—</b>% · Avg <b id="cpu-av">—</b>%</div>
+    </div>
+    <div class="card">
+      <div class="card-accent" style="background:linear-gradient(90deg,var(--c5),transparent)"></div>
+      <div class="card-label">Frequency</div>
+      <div class="card-value"><span id="cpu-freq">—</span><span class="card-unit" id="cpu-freq-u">MHz</span></div>
+      <div class="card-sub">Max <b id="cpu-freq-max">—</b></div>
+    </div>
+    <div class="card">
+      <div class="card-accent" style="background:linear-gradient(90deg,var(--c2),transparent)"></div>
+      <div class="card-label">Temperature</div>
+      <div class="card-value"><span id="cpu-temp">—</span><span class="card-unit">°C</span></div>
+      <div class="card-sub">Package die</div>
+    </div>
+    <div class="card">
+      <div class="card-accent" style="background:linear-gradient(90deg,var(--c3),transparent)"></div>
+      <div class="card-label">Cores</div>
+      <div class="card-value"><span id="cpu-logi">—</span></div>
+      <div class="card-sub"><b id="cpu-phys">—</b> physical</div>
+    </div>
+  </div>
+
+  <div class="section-title">Per-core Usage</div>
+  <div class="core-grid" id="core-grid"></div>
+
+  <div class="section-title">History</div>
+  <div class="charts">
+    <div class="chart-box">
+      <div class="chart-hdr">
+        <span class="chart-title">CPU %</span>
+        <span class="chart-meta">peak <b id="c-cpu-pk" style="color:var(--c1)">—</b></span>
+      </div>
+      <div class="chart-wrap"><canvas id="ch-cpu"></canvas></div>
+    </div>
+    <div class="chart-box">
+      <div class="chart-hdr">
+        <span class="chart-title">Temperature °C</span>
+        <span class="chart-meta" id="c-temp-meta"></span>
+      </div>
+      <div class="chart-wrap"><canvas id="ch-temp"></canvas></div>
+    </div>
+  </div>
+
+  <div class="section-title">Top Processes by CPU</div>
+  <div class="tbl-box">
+    <div class="tbl-hdr">
+      <span class="tbl-title">CPU Usage per Process</span>
+      <span class="tbl-count" id="cpu-proc-count">—</span>
+    </div>
+    <table id="tbl-cpu">
+      <thead><tr>
+        <th data-col="0">Process</th>
+        <th data-col="1">CPU %</th>
+        <th data-col="2">RAM MB</th>
+        <th data-col="3">Instances</th>
+      </tr></thead>
+      <tbody id="tbody-cpu"></tbody>
+    </table>
+  </div>
+</div>
+
+<!-- ════════════════ RAM TAB ════════════════ -->
+<div class="panel" id="panel-ram">
+
+  <div class="section-title">Overview</div>
+  <div class="cards">
+    <div class="card">
+      <div class="card-accent" style="background:linear-gradient(90deg,var(--c2),transparent)"></div>
+      <div class="card-label">RAM Used</div>
+      <div class="card-value"><span id="ram-pct">—</span><span class="card-unit">%</span></div>
+      <div class="gbar-wrap"><div class="gbar" id="ram-g" style="background:linear-gradient(90deg,var(--c2),#ff3860)"></div></div>
+      <div class="card-sub"><b id="ram-used">—</b> / <b id="ram-tot">—</b> MB</div>
+    </div>
+    <div class="card">
+      <div class="card-accent" style="background:linear-gradient(90deg,var(--c3),transparent)"></div>
+      <div class="card-label">Available</div>
+      <div class="card-value"><span id="ram-avail">—</span><span class="card-unit">MB</span></div>
+      <div class="card-sub">Free for apps</div>
+    </div>
+    <div class="card">
+      <div class="card-accent" style="background:linear-gradient(90deg,var(--c5),transparent)"></div>
+      <div class="card-label">Swap</div>
+      <div class="card-value"><span id="ram-swap-pct">—</span><span class="card-unit">%</span></div>
+      <div class="gbar-wrap"><div class="gbar" id="swap-g" style="background:linear-gradient(90deg,var(--c5),#c0a000)"></div></div>
+      <div class="card-sub"><b id="ram-swap-used">—</b> / <b id="ram-swap-tot">—</b> MB</div>
+    </div>
+    <div class="card">
+      <div class="card-accent" style="background:linear-gradient(90deg,var(--c4),transparent)"></div>
+      <div class="card-label">Session Peak</div>
+      <div class="card-value"><span id="ram-pk">—</span><span class="card-unit">%</span></div>
+      <div class="card-sub">Avg <b id="ram-av">—</b>%</div>
+    </div>
+  </div>
+
+  <div class="section-title">History</div>
+  <div class="charts">
+    <div class="chart-box">
+      <div class="chart-hdr">
+        <span class="chart-title">RAM %</span>
+        <span class="chart-meta">peak <b id="c-ram-pk" style="color:var(--c2)">—</b></span>
+      </div>
+      <div class="chart-wrap"><canvas id="ch-ram"></canvas></div>
+    </div>
+  </div>
+
+  <div class="section-title">Top Processes by Memory</div>
+  <div class="tbl-box">
+    <div class="tbl-hdr">
+      <span class="tbl-title">RAM Usage per Process</span>
+      <span class="tbl-count" id="ram-proc-count">—</span>
+    </div>
+    <table id="tbl-ram">
+      <thead><tr>
+        <th data-col="0">Process</th>
+        <th data-col="1">RAM MB</th>
+        <th data-col="2">CPU %</th>
+        <th data-col="3">Instances</th>
+      </tr></thead>
+      <tbody id="tbody-ram"></tbody>
+    </table>
+  </div>
+</div>
+
+<!-- ════════════════ GPU TAB ════════════════ -->
+<div class="panel" id="panel-gpu">
+  <!-- GPU available state -->
+  <div id="gpu-ok-section">
+    <div class="section-title">Overview</div>
+    <div class="cards">
+      <div class="card">
+        <div class="card-accent" style="background:linear-gradient(90deg,var(--c4),transparent)"></div>
+        <div class="card-label">GPU Load</div>
+        <div class="card-value"><span id="gpu-load">—</span><span class="card-unit">%</span></div>
+        <div class="gbar-wrap"><div class="gbar" id="gpu-load-g" style="background:linear-gradient(90deg,var(--c4),#6e40c9)"></div></div>
+        <div class="card-sub">Peak <b id="gpu-pk">—</b>%</div>
+      </div>
+      <div class="card">
+        <div class="card-accent" style="background:linear-gradient(90deg,var(--c1),transparent)"></div>
+        <div class="card-label">VRAM</div>
+        <div class="card-value"><span id="gpu-mem">—</span><span class="card-unit">%</span></div>
+        <div class="gbar-wrap"><div class="gbar" id="gpu-mem-g" style="background:linear-gradient(90deg,var(--c1),#0080ff)"></div></div>
+      </div>
+      <div class="card">
+        <div class="card-accent" style="background:linear-gradient(90deg,var(--c2),transparent)"></div>
+        <div class="card-label">Temperature</div>
+        <div class="card-value"><span id="gpu-temp">—</span><span class="card-unit">°C</span></div>
+      </div>
+      <div class="card">
+        <div class="card-accent" style="background:linear-gradient(90deg,var(--c3),transparent)"></div>
+        <div class="card-label">Backend</div>
+        <div class="card-value" style="font-size:15px"><span id="gpu-backend">—</span></div>
+      </div>
+    </div>
+
+    <div class="section-title">History</div>
+    <div class="charts">
+      <div class="chart-box">
+        <div class="chart-hdr">
+          <span class="chart-title">GPU Load %</span>
+          <span class="chart-meta">peak <b id="c-gpu-pk" style="color:var(--c4)">—</b></span>
+        </div>
+        <div class="chart-wrap"><canvas id="ch-gpu"></canvas></div>
+      </div>
+    </div>
+
+    <div class="section-title">Processes Using GPU</div>
+    <div class="tbl-box">
+      <div class="tbl-hdr">
+        <span class="tbl-title">VRAM per Process</span>
+        <span class="tbl-count" id="gpu-proc-count">—</span>
+      </div>
+      <table id="tbl-gpu">
+        <thead><tr>
+          <th data-col="0">Process</th>
+          <th data-col="1">VRAM MB</th>
+          <th data-col="2">CPU %</th>
+          <th data-col="3">RAM MB</th>
+          <th data-col="4">Instances</th>
+        </tr></thead>
+        <tbody id="tbody-gpu"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- GPU unavailable state -->
+  <div class="unavail-banner hidden" id="gpu-unavail">
+    <h2>No GPU Detected</h2>
+    <p>
+      No supported GPU backend was found on this system.<br>
+      Install <code>pynvml</code> for NVIDIA · <code>pyamdgpuinfo</code> for AMD<br>
+      Linux Intel iGPU is detected automatically via <code>/sys</code>
+    </p>
+  </div>
+</div>
+
+<!-- ════════════════ NETWORK TAB ════════════════ -->
+<div class="panel" id="panel-net">
+
+  <div class="section-title">Live Throughput</div>
+  <div class="cards">
+    <div class="card">
+      <div class="card-accent" style="background:linear-gradient(90deg,var(--c1),transparent)"></div>
+      <div class="card-label">Transmit</div>
+      <div class="card-value"><span id="net-tx">—</span><span class="card-unit">KB/s</span></div>
+      <div class="card-sub">Peak <b id="net-ptx">—</b> KB/s</div>
+    </div>
+    <div class="card">
+      <div class="card-accent" style="background:linear-gradient(90deg,var(--c7),transparent)"></div>
+      <div class="card-label">Receive</div>
+      <div class="card-value"><span id="net-rx">—</span><span class="card-unit">KB/s</span></div>
+      <div class="card-sub">Peak <b id="net-prx">—</b> KB/s</div>
+    </div>
+    <div class="card">
+      <div class="card-accent" style="background:linear-gradient(90deg,var(--c3),transparent)"></div>
+      <div class="card-label">SSID</div>
+      <div class="card-value" style="font-size:15px;overflow:hidden;text-overflow:ellipsis"><span id="net-ssid">—</span></div>
+      <div class="card-sub">Wi-Fi network</div>
+    </div>
+    <div class="card">
+      <div class="card-accent" style="background:linear-gradient(90deg,var(--c4),transparent)"></div>
+      <div class="card-label">Signal</div>
+      <div class="card-value"><span id="net-sig">—</span><span class="card-unit" id="net-sig-u"> dBm</span></div>
+      <div class="card-sub">Interface: <b id="net-iface">—</b></div>
+    </div>
+  </div>
+
+  <div class="section-title">History</div>
+  <div class="charts">
+    <div class="chart-box">
+      <div class="chart-hdr">
+        <span class="chart-title">TX KB/s</span>
+      </div>
+      <div class="chart-wrap"><canvas id="ch-tx"></canvas></div>
+    </div>
+    <div class="chart-box">
+      <div class="chart-hdr">
+        <span class="chart-title">RX KB/s</span>
+      </div>
+      <div class="chart-wrap"><canvas id="ch-rx"></canvas></div>
+    </div>
+  </div>
+
+  <div class="section-title">Network Interfaces</div>
+  <div class="iface-grid" id="iface-grid"></div>
+</div>
+
+<!-- ════════════════ STORAGE TAB ════════════════ -->
+<div class="panel" id="panel-disk">
+
+  <div class="section-title">I/O Activity</div>
+  <div class="cards">
+    <div class="card">
+      <div class="card-accent" style="background:linear-gradient(90deg,var(--c3),transparent)"></div>
+      <div class="card-label">Read Speed</div>
+      <div class="card-value"><span id="disk-rd">—</span><span class="card-unit">MB/s</span></div>
+    </div>
+    <div class="card">
+      <div class="card-accent" style="background:linear-gradient(90deg,var(--c6),transparent)"></div>
+      <div class="card-label">Write Speed</div>
+      <div class="card-value"><span id="disk-wr">—</span><span class="card-unit">MB/s</span></div>
+    </div>
+    <div class="card">
+      <div class="card-accent" style="background:linear-gradient(90deg,var(--c5),transparent)"></div>
+      <div class="card-label">Primary Used</div>
+      <div class="card-value"><span id="disk-pct">—</span><span class="card-unit">%</span></div>
+      <div class="gbar-wrap"><div class="gbar" id="disk-g" style="background:linear-gradient(90deg,var(--c5),#c0a000)"></div></div>
+      <div class="card-sub" id="disk-path-lbl">—</div>
+    </div>
+    <div class="card">
+      <div class="card-accent" style="background:linear-gradient(90deg,var(--c4),transparent)"></div>
+      <div class="card-label">Free Space</div>
+      <div class="card-value"><span id="disk-free">—</span><span class="card-unit">GB</span></div>
+      <div class="card-sub">of <b id="disk-total">—</b> GB total</div>
+    </div>
+  </div>
+
+  <div class="section-title">I/O History</div>
+  <div class="charts">
+    <div class="chart-box">
+      <div class="chart-hdr">
+        <span class="chart-title">Read MB/s</span>
+      </div>
+      <div class="chart-wrap"><canvas id="ch-drd"></canvas></div>
+    </div>
+    <div class="chart-box">
+      <div class="chart-hdr">
+        <span class="chart-title">Write MB/s</span>
+      </div>
+      <div class="chart-wrap"><canvas id="ch-dwr"></canvas></div>
+    </div>
+  </div>
+
+  <div class="section-title">Partitions</div>
+  <div class="part-list" id="part-list"></div>
+</div>
+
+</main>
+<footer id="footer">Activity Monitor · Initialising…</footer>
+
+<script>
+// ════════════════════════════════════════════════════════════════════════════
+//  SPA ENGINE — no page reload, surgical DOM updates only
+// ════════════════════════════════════════════════════════════════════════════
+
+'use strict';
+
+// ── Constants ────────────────────────────────────────────────────────────────
+const POLL_MS       = __INTERVAL__ * 1000;
+const DATA_URL      = 'data.json';
+const CHART_MAX_PTS = 120;
+
+// ── Safe accessors ───────────────────────────────────────────────────────────
+const $ = id => document.getElementById(id);
+const na = v => (v == null || v === '' ? 'N/A' : v);
+
+// Set an element's textContent only when the value actually changed.
+// This avoids browser layout thrashing for static/unchanged values.
+const _prev = {};
+function setText(id, val) {
+  const s = String(na(val));
+  if (_prev[id] === s) return;
+  _prev[id] = s;
+  const el = $(id);
+  if (el) el.textContent = s;
+}
+
+function setWidth(id, pct) {
+  const el = $(id);
+  if (!el) return;
+  const w = Math.min(+pct || 0, 100).toFixed(1) + '%';
+  if (el.style.width !== w) el.style.width = w;
+}
+
+function setClass(id, cls, on) {
+  const el = $(id);
+  if (el) el.classList.toggle(cls, on);
+}
+
+function show(id){ const el=$(id); if(el) el.classList.remove('hidden') }
+function hide(id){ const el=$(id); if(el) el.classList.add('hidden') }
+
+// ── Tab switching ─────────────────────────────────────────────────────────────
+let _activeTab = 'cpu';
+
+document.querySelectorAll('.tab').forEach(btn => {
+  btn.addEventListener('click', () => {
+    const tab = btn.dataset.tab;
+    if (tab === _activeTab) return;
+    _activeTab = tab;
+    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+    document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
+    btn.classList.add('active');
+    const panel = $(`panel-${tab}`);
+    if (panel) panel.classList.add('active');
+  });
+});
+
+// ── Chart engine ──────────────────────────────────────────────────────────────
+// Creates Chart.js line charts with shared styling.
+// Charts push new points in-place without destroying and re-creating.
+
+const _charts = {};
+
+function _chartOpts(yMin, yMax, tooltipSuffix) {
+  return {
+    responsive: true,
+    maintainAspectRatio: false,
+    animation: { duration: 150 },
+    interaction: { intersect: false, mode: 'index' },
+    plugins: {
+      legend: { display: false },
+      tooltip: {
+        backgroundColor: '#111928',
+        borderColor: '#1c2a42', borderWidth: 1,
+        titleFont: { family: 'JetBrains Mono', size: 9 },
+        bodyFont:  { family: 'JetBrains Mono', size: 10 },
+        callbacks: {
+          label: ctx => ` ${ctx.parsed.y != null ? ctx.parsed.y.toFixed(1) : 'N/A'}${tooltipSuffix}`
+        }
+      }
+    },
+    scales: {
+      x: {
+        grid: { color: '#1c2a42' },
+        ticks: { color: '#4a6080', font: { family: 'JetBrains Mono', size: 8 }, maxTicksLimit: 7 }
+      },
+      y: {
+        grid: { color: '#1c2a42' },
+        ticks: { color: '#4a6080', font: { family: 'JetBrains Mono', size: 9 } },
+        min: yMin, max: yMax
+      }
+    }
+  };
+}
+
+function makeChart(canvasId, color, bgColor, yMin, yMax, suffix='%') {
+  const el = $(canvasId);
+  if (!el) return null;
+  const ch = new Chart(el, {
+    type: 'line',
+    data: {
+      labels: [],
+      datasets: [{
+        data: [],
+        borderColor: color,
+        backgroundColor: bgColor,
+        borderWidth: 1.5,
+        pointRadius: 0,
+        tension: 0.38,
+        fill: true
+      }]
+    },
+    options: _chartOpts(yMin, yMax, suffix)
+  });
+  _charts[canvasId] = ch;
+  return ch;
+}
+
+// Seed a chart with historical data; called once after first successful fetch.
+function seedChart(canvasId, labels, values) {
+  const ch = _charts[canvasId];
+  if (!ch) return;
+  ch.data.labels   = [...labels].slice(-CHART_MAX_PTS);
+  ch.data.datasets[0].data = [...values].slice(-CHART_MAX_PTS);
+  ch.update('none');
+}
+
+// Push one new data point; shift oldest off when at capacity.
+function pushChart(canvasId, label, value) {
+  const ch = _charts[canvasId];
+  if (!ch) return;
+  ch.data.labels.push(label);
+  ch.data.datasets[0].data.push(value ?? null);
+  if (ch.data.labels.length > CHART_MAX_PTS) {
+    ch.data.labels.shift();
+    ch.data.datasets[0].data.shift();
+  }
+  ch.update('none');
+}
+
+// Update Y-axis range without a full rebuild.
+function setYRange(canvasId, yMin, yMax) {
+  const ch = _charts[canvasId];
+  if (!ch) return;
+  const sc = ch.options.scales.y;
+  if (sc.min !== yMin || sc.max !== yMax) {
+    sc.min = yMin; sc.max = yMax;
+  }
+}
+
+// ── Chart initialisation ──────────────────────────────────────────────────────
+let _chartsReady = false;
+
+function initCharts(d) {
+  const r = d.ranges || {};
+  makeChart('ch-cpu',  '#00e5ff', 'rgba(0,229,255,.07)',  ...(r.cpu  || [0,100]), '%');
+  makeChart('ch-temp', '#ff6b35', 'rgba(255,107,53,.06)', 0, null, '°C');
+  makeChart('ch-ram',  '#ff6b35', 'rgba(255,107,53,.07)', ...(r.ram  || [0,100]), '%');
+  makeChart('ch-gpu',  '#bd93f9', 'rgba(189,147,249,.07)',...(r.gpu  || [0,100]), '%');
+  makeChart('ch-tx',   '#00e5ff', 'rgba(0,229,255,.06)',  0, (r.net || [0,1])[1], ' KB/s');
+  makeChart('ch-rx',   '#8be9fd', 'rgba(139,233,253,.06)',0, (r.net || [0,1])[1], ' KB/s');
+  makeChart('ch-drd',  '#7fff7f', 'rgba(127,255,127,.06)',0, null, ' MB/s');
+  makeChart('ch-dwr',  '#ff79c6', 'rgba(255,121,198,.06)',0, null, ' MB/s');
+
+  // Seed from history
+  const h   = d.history || [];
+  const lbl = h.map(x => x.ts);
+  seedChart('ch-cpu',  lbl, h.map(x => x.cpu));
+  seedChart('ch-temp', lbl, h.map(x => x.temp));
+  seedChart('ch-ram',  lbl, h.map(x => x.ram));
+  seedChart('ch-gpu',  lbl, h.map(x => x.gpu));
+  seedChart('ch-tx',   lbl, h.map(x => x.tx));
+  seedChart('ch-rx',   lbl, h.map(x => x.rx));
+  seedChart('ch-drd',  lbl, h.map(x => x.drd));
+  seedChart('ch-dwr',  lbl, h.map(x => x.dwr));
+
+  _chartsReady = true;
+}
+
+// ── Uptime formatter ─────────────────────────────────────────────────────────
+function fmtUptime(s) {
+  if (s == null) return 'N/A';
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sc = s % 60;
+  if (h) return `${h}h ${String(m).padStart(2,'0')}m`;
+  if (m) return `${m}m ${String(sc).padStart(2,'0')}s`;
+  return `${sc}s`;
+}
+
+// ── Minibar helper ────────────────────────────────────────────────────────────
+function minibar(val, max, color) {
+  const pct = max > 0 ? Math.min(val / max * 100, 100).toFixed(0) : 0;
+  return `<span class="minibar"><span class="minibar-fill" style="width:${pct}%;background:${color}"></span></span>`;
+}
+
+// ── Table renderer — full rebuild only when row count or names change ─────────
+// Uses a keyed approach: rows are re-used when the process name is the same.
+// This avoids the cost of destroying and re-creating DOM on every cycle.
+
+const _tbodyState = {};   // key: tbody id -> { rows: Map<name, tr> }
+
+function updateTable(tbodyId, items, colFns) {
+  const tbody = $(tbodyId);
+  if (!tbody) return;
+
+  const state = _tbodyState[tbodyId] || (_tbodyState[tbodyId] = { rows: new Map() });
+  const newNames = new Set(items.map(r => r.name));
+
+  // Remove rows for items no longer in the list
+  for (const [name, tr] of state.rows) {
+    if (!newNames.has(name)) {
+      tbody.removeChild(tr);
+      state.rows.delete(name);
+    }
+  }
+
+  // Update or insert rows in order
+  let refNode = tbody.firstChild;
+  for (const item of items) {
+    let tr = state.rows.get(item.name);
+    if (!tr) {
+      tr = document.createElement('tr');
+      state.rows.set(item.name, tr);
+    }
+    // Re-render cell HTML only if content changed
+    const newHtml = colFns.map(fn => `<td>${fn(item)}</td>`).join('');
+    if (tr.innerHTML !== newHtml) tr.innerHTML = newHtml;
+
+    // Maintain visual order
+    if (tr !== refNode) tbody.insertBefore(tr, refNode);
+    refNode = tr.nextSibling;
+  }
+}
+
+// Table column sort
+const _sortState = {};
+document.querySelectorAll('thead th[data-col]').forEach(th => {
+  th.addEventListener('click', () => {
+    const tbl    = th.closest('table');
+    const colIdx = +th.dataset.col;
+    const id     = tbl.id;
+    const prev   = _sortState[id] || { col: -1, asc: true };
+    const asc    = prev.col === colIdx ? !prev.asc : true;
+    _sortState[id] = { col: colIdx, asc };
+
+    // Reset all header classes in this table
+    tbl.querySelectorAll('thead th').forEach(h => h.classList.remove('sort-asc','sort-desc'));
+    th.classList.add(asc ? 'sort-asc' : 'sort-desc');
+
+    // Sort rows by cell text/data-v attribute
+    const tbody = tbl.querySelector('tbody');
+    [...tbody.querySelectorAll('tr')].sort((a, b) => {
+      const av = a.cells[colIdx]?.dataset?.v ?? a.cells[colIdx]?.textContent ?? '';
+      const bv = b.cells[colIdx]?.dataset?.v ?? b.cells[colIdx]?.textContent ?? '';
+      const n  = v => isNaN(+v) ? v : +v;
+      return (asc ? 1 : -1) * (n(av) > n(bv) ? 1 : n(av) < n(bv) ? -1 : 0);
+    }).forEach(r => tbody.appendChild(r));
+  });
+});
+
+// ── Core grid renderer ────────────────────────────────────────────────────────
+let _coreCount = 0;
+
+function renderCoreGrid(cores) {
+  const grid = $('core-grid');
+  if (!grid) return;
+  if (!cores || cores.length === 0) {
+    grid.innerHTML = '<span class="na">Per-core data unavailable</span>';
+    return;
+  }
+
+  // Rebuild only when core count changes (first render or CPU topology change)
+  if (cores.length !== _coreCount) {
+    _coreCount = cores.length;
+    grid.innerHTML = cores.map((_, i) => `
+      <div class="core-card">
+        <div class="core-lbl">Core ${i}</div>
+        <div class="core-val"><span id="core-${i}">—</span><span class="cu">%</span></div>
+        <div class="gbar-wrap"><div class="gbar" id="core-g-${i}"
+          style="background:linear-gradient(90deg,var(--c1),#0080ff)"></div></div>
+      </div>`).join('');
+  }
+
+  // Update values in-place
+  cores.forEach((v, i) => {
+    setText(`core-${i}`, v ?? 'N/A');
+    setWidth(`core-g-${i}`, v ?? 0);
+  });
+}
+
+// ── Interface grid renderer ───────────────────────────────────────────────────
+let _lastIfaceJson = '';
+
+function renderIfaceGrid(ifaces) {
+  const grid = $('iface-grid');
+  if (!grid) return;
+
+  const json = JSON.stringify(ifaces);
+  if (json === _lastIfaceJson) return;   // nothing changed
+  _lastIfaceJson = json;
+
+  if (!ifaces || !ifaces.length) {
+    grid.innerHTML = '<span class="na">No interface data available</span>';
+    return;
+  }
+
+  grid.innerHTML = ifaces.map(i => `
+    <div class="iface-card">
+      <div class="iface-name">
+        <span class="${i.up ? 'dot-up' : 'dot-down'}">●</span>
+        ${i.name || 'Unknown'}
+      </div>
+      <div class="iface-row">IPv4    <span>${i.ipv4 || 'N/A'}</span></div>
+      <div class="iface-row">Speed   <span>${i.speed ? i.speed + ' Mbps' : 'N/A'}</span></div>
+      <div class="iface-row">Sent    <span>${i.sent_mb != null ? i.sent_mb + ' MB' : 'N/A'}</span></div>
+      <div class="iface-row">Received<span>${i.recv_mb != null ? i.recv_mb + ' MB' : 'N/A'}</span></div>
+    </div>`).join('');
+}
+
+// ── Partition list renderer ───────────────────────────────────────────────────
+let _lastPartsJson = '';
+
+function renderPartitions(parts) {
+  const list = $('part-list');
+  if (!list) return;
+
+  const json = JSON.stringify(parts);
+  if (json === _lastPartsJson) return;
+  _lastPartsJson = json;
+
+  if (!parts || !parts.length) {
+    list.innerHTML = '<div class="na" style="padding:12px">No partition data available</div>';
+    return;
+  }
+
+  const palette = ['var(--c4)','var(--c1)','var(--c3)','var(--c6)','var(--c5)'];
+  list.innerHTML = parts.map((p, i) => {
+    const pct   = p.used_pct ?? 0;
+    const color = pct > 90 ? '#ff5555' : pct > 75 ? 'var(--c2)' : palette[i % palette.length];
+    return `
+    <div class="part-card">
+      <div class="part-top">
+        <span class="part-name">
+          ${p.mountpoint || 'N/A'}
+          <span class="part-fstype">${p.fstype || '?'}</span>
+        </span>
+        <span class="part-pct">${pct}%</span>
+      </div>
+      <div class="part-bar">
+        <div class="part-bar-fill" style="width:${pct}%;background:${color}"></div>
+      </div>
+      <div class="part-meta">
+        <span>Total <b>${p.total_gb ?? 'N/A'} GB</b></span>
+        <span>Used  <b>${p.used_gb  ?? 'N/A'} GB</b></span>
+        <span>Free  <b>${p.free_gb  ?? 'N/A'} GB</b></span>
+        <span style="color:var(--muted)">${p.device || ''}</span>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  MAIN UPDATE FUNCTION — called on every successful poll
+//  Each section only touches the DOM nodes it owns.
+// ════════════════════════════════════════════════════════════════════════════
+
+function update(d) {
+  if (!_chartsReady) initCharts(d);
+
+  const hist = d.history || [];
+  const ts   = hist.length ? hist[hist.length - 1].ts : '';
+  const lv   = hist.length ? hist[hist.length - 1]    : {};
+
+  // ── Header ────────────────────────────────────────────────────────────────
+  const sess = d.session || {};
+  setText('h-host',  `${sess.user || '?'}@${sess.host || '?'} · ${(sess.os || '').split('-')[0]}`);
+  setText('h-uptime', fmtUptime(d.uptime));
+  setText('h-ts',     (d.ts || '').slice(11, 19));
+  setText('h-snaps',  d.snaps ?? 'N/A');
+  setText('h-procs',  d.procs ?? 'N/A');
+
+  const storOk = sess.storage_ok !== false;
+  setText('h-storage', storOk
+    ? `${sess.disk_free_mb ?? '?'} MB free`
+    : 'Low space!');
+  setClass('h-storage-badge', 'warn', !storOk);
+  setClass('hpulse', 'error', !storOk);
+
+  // ── Footer ────────────────────────────────────────────────────────────────
+  setText('footer',
+    `Activity Monitor · ${(sess.os || '').split('-')[0]} · interval __INTERVAL__s · ${d.ts || ''}`
+  );
+
+  // ── CPU tab ──────────────────────────────────────────────────────────────
+  const cpu = d.cpu || {};
+  setText('cpu-tot',      cpu.now   ?? 'N/A');
+  setWidth('cpu-tot-g',   cpu.now   ?? 0);
+  setText('cpu-pk',       cpu.peak  ?? 'N/A');
+  setText('cpu-av',       cpu.avg   ?? 'N/A');
+  setText('c-cpu-pk',    (cpu.peak  ?? 'N/A') + '%');
+  setText('cpu-temp',     cpu.temp_c != null ? cpu.temp_c : 'N/A');
+  setText('cpu-freq',     cpu.freq_mhz ? Math.round(cpu.freq_mhz) : 'N/A');
+  setText('cpu-freq-max', cpu.freq_max_mhz ? Math.round(cpu.freq_max_mhz) : '—');
+  setText('cpu-logi',     cpu.logi  ?? 'N/A');
+  setText('cpu-phys',     cpu.phys  ?? 'N/A');
+  renderCoreGrid(cpu.per_core);
+
+  const cpuTop = cpu.top || [];
+  setText('cpu-proc-count', cpuTop.length + ' processes');
+  updateTable('tbody-cpu', cpuTop, [
+    r => `<span class="td-name" title="${r.name}">${r.name}</span>`,
+    r => `<span class="td-cpu" data-v="${r.cpu}">${r.cpu}%${minibar(r.cpu, 100, 'var(--c1)')}</span>`,
+    r => `<span class="td-ram" data-v="${r.mem_mb}">${r.mem_mb}</span>`,
+    r => `<span class="td-muted" data-v="${r.inst}">${r.inst}</span>`,
+  ]);
+
+  // ── RAM tab ───────────────────────────────────────────────────────────────
+  const ram = d.ram || {};
+  setText('ram-pct',      ram.pct     ?? 'N/A');
+  setWidth('ram-g',       ram.pct     ?? 0);
+  setText('ram-used',     ram.used_mb ?? 'N/A');
+  setText('ram-tot',      ram.total_mb ?? 'N/A');
+  setText('ram-avail',    ram.avail_mb ?? 'N/A');
+  setText('ram-pk',       ram.peak    ?? 'N/A');
+  setText('ram-av',       ram.avg     ?? 'N/A');
+  setText('c-ram-pk',    (ram.peak    ?? 'N/A') + '%');
+  setText('ram-swap-pct', ram.swap_pct ?? 'N/A');
+  setWidth('swap-g',      ram.swap_pct ?? 0);
+  setText('ram-swap-used', ram.swap_used_mb  ?? 'N/A');
+  setText('ram-swap-tot',  ram.swap_total_mb ?? 'N/A');
+
+  const ramTop = ram.top || [];
+  setText('ram-proc-count', ramTop.length + ' processes');
+  const ramTotalMb = ram.total_mb || 1;
+  updateTable('tbody-ram', ramTop, [
+    r => `<span class="td-name" title="${r.name}">${r.name}</span>`,
+    r => `<span class="td-ram" data-v="${r.mem_mb}">${r.mem_mb} MB${minibar(r.mem_mb, ramTotalMb, 'var(--c2)')}</span>`,
+    r => `<span class="td-cpu" data-v="${r.cpu}">${r.cpu}%</span>`,
+    r => `<span class="td-muted" data-v="${r.inst}">${r.inst}</span>`,
+  ]);
+
+  // ── GPU tab ───────────────────────────────────────────────────────────────
+  const gpu = d.gpu || {};
+  if (gpu.available) {
+    show('gpu-ok-section'); hide('gpu-unavail');
+    setText('gpu-load',    gpu.load    ?? 'N/A');
+    setWidth('gpu-load-g', gpu.load    ?? 0);
+    setText('gpu-pk',      gpu.peak    ?? 'N/A');
+    setText('c-gpu-pk',   (gpu.peak    ?? 'N/A') + '%');
+    setText('gpu-mem',     gpu.mem_pct ?? 'N/A');
+    setWidth('gpu-mem-g',  gpu.mem_pct ?? 0);
+    setText('gpu-temp',    gpu.temp_c  ?? 'N/A');
+    setText('gpu-backend', gpu.backend || 'N/A');
+
+    const gpuTop = gpu.top || [];
+    setText('gpu-proc-count', gpuTop.length + ' processes');
+    updateTable('tbody-gpu', gpuTop, [
+      r => `<span class="td-name" title="${r.name}">${r.name}</span>`,
+      r => `<span class="td-gpu" data-v="${r.gpu_mb}">${r.gpu_mb} MB${minibar(r.gpu_mb, 8192, 'var(--c4)')}</span>`,
+      r => `<span class="td-cpu" data-v="${r.cpu}">${r.cpu}%</span>`,
+      r => `<span class="td-ram" data-v="${r.mem_mb}">${r.mem_mb}</span>`,
+      r => `<span class="td-muted" data-v="${r.inst}">${r.inst}</span>`,
+    ]);
+  } else {
+    hide('gpu-ok-section'); show('gpu-unavail');
+  }
+
+  // ── Network tab ───────────────────────────────────────────────────────────
+  const net = d.net || {};
+  setText('net-tx',   net.tx_kb   ?? 'N/A');
+  setText('net-rx',   net.rx_kb   ?? 'N/A');
+  setText('net-ptx',  net.peak_tx ?? 'N/A');
+  setText('net-prx',  net.peak_rx ?? 'N/A');
+  setText('net-ssid', net.ssid   || 'N/A');
+  setText('net-sig',  net.signal_dbm != null ? net.signal_dbm : 'N/A');
+  setText('net-iface', net.iface || 'N/A');
+  renderIfaceGrid(net.all_ifaces || []);
+
+  // ── Storage tab ───────────────────────────────────────────────────────────
+  const disk = d.disk || {};
+  setText('disk-rd',    disk.read_mbs  ?? 'N/A');
+  setText('disk-wr',    disk.write_mbs ?? 'N/A');
+  setText('disk-pct',   disk.used_pct  ?? 'N/A');
+  setWidth('disk-g',    disk.used_pct  ?? 0);
+  setText('disk-path-lbl', disk.path   || 'N/A');
+  setText('disk-free',  disk.free_gb   ?? 'N/A');
+  setText('disk-total', disk.total_gb  ?? 'N/A');
+  renderPartitions(disk.partitions || []);
+
+  // ── Dynamic Y-range updates (no chart rebuild) ────────────────────────────
+  const ranges = d.ranges || {};
+  if (ranges.cpu)  setYRange('ch-cpu',  ranges.cpu[0],  ranges.cpu[1]);
+  if (ranges.ram)  setYRange('ch-ram',  ranges.ram[0],  ranges.ram[1]);
+  if (ranges.gpu)  setYRange('ch-gpu',  ranges.gpu[0],  ranges.gpu[1]);
+  if (ranges.net) {
+    setYRange('ch-tx', 0, ranges.net[1]);
+    setYRange('ch-rx', 0, ranges.net[1]);
+  }
+
+  // ── Chart push (live point only) ──────────────────────────────────────────
+  if (ts) {
+    pushChart('ch-cpu',  ts, lv.cpu  ?? null);
+    pushChart('ch-temp', ts, lv.temp ?? null);
+    pushChart('ch-ram',  ts, lv.ram  ?? null);
+    pushChart('ch-gpu',  ts, lv.gpu  ?? null);
+    pushChart('ch-tx',   ts, lv.tx   ?? null);
+    pushChart('ch-rx',   ts, lv.rx   ?? null);
+    pushChart('ch-drd',  ts, lv.drd  ?? null);
+    pushChart('ch-dwr',  ts, lv.dwr  ?? null);
+  }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  POLL LOOP — exponential back-off on failure, no freeze on large payloads
+// ════════════════════════════════════════════════════════════════════════════
+
+let _pollTimer   = null;
+let _failStreak  = 0;
+const _MAX_FAIL_DELAY = 30_000;
+
+async function poll() {
+  try {
+    const resp = await fetch(DATA_URL + '?t=' + Date.now());
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const d = await resp.json();
+    _failStreak = 0;
+    update(d);
+  } catch (err) {
+    _failStreak++;
+    // Indicate connection issue in header
+    setClass('hpulse', 'error', true);
+    const msg = `Offline · retrying (${_failStreak}) · ${err.message}`;
+    setText('h-ts', msg.slice(0, 50));
+    console.warn('[AM] poll error:', err.message);
+  } finally {
+    // Back-off: double delay per failure up to MAX_FAIL_DELAY
+    const delay = _failStreak > 0
+      ? Math.min(POLL_MS * (2 ** (_failStreak - 1)), _MAX_FAIL_DELAY)
+      : POLL_MS;
+    _pollTimer = setTimeout(poll, delay);
+  }
+}
+
+// Kick off on load
+poll();
+</script>
+</body></html>
+"""
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 21 -- MAIN EXECUTION ENGINE
+#
+#  Architecture: four independent modules, each in its own thread
+#  ================================================================
+#
+#  Module A — Collector
+#    Runs on the main thread (avoids psutil signal-handler issues on Windows).
+#    Calls collect() every INTERVAL_SEC, applying adaptive timing to avoid
+#    CPU spikes when the system is under load.
+#    Pushes Snapshot objects into a bounded collector → writer queue.
+#
+#  Module B — Writer
+#    Daemon thread: drains the collector queue, stages rows into the DB
+#    write buffer, flushes to SQLite, runs periodic prune + WAL checkpoint.
+#    Pushes (snap_id, Snapshot) pairs into a bounded writer → renderer queue.
+#
+#  Module C — Renderer
+#    Daemon thread: drains the writer queue, calls build_data(), enrich_live(),
+#    write_json_data(), and write_snapshot_file().
+#    Owns all JSON output; the writer thread never touches JSON.
+#
+#  Module D — Watchdog
+#    Background thread: monitors all three module threads at 5-second intervals.
+#    If a thread is found dead it is restarted (up to MAX_RESTARTS times before
+#    giving up and setting the module's "failed" flag).
+#    Also monitors DB connection health and storage health.
+#
+#  Communication
+#  =============
+#    collector_q   Queue[Snapshot]          A → B
+#    renderer_q    Queue[Tuple[int, Snapshot]]  B → C
+#
+#  Adaptive timing
+#  ===============
+#    Idle detection: if CPU < IDLE_CPU_PCT for IDLE_STREAK_NEEDED consecutive
+#    cycles, the collector sleep is extended up to MAX_IDLE_INTERVAL_SEC.
+#    This halves unnecessary process scans on a quiet system.
+#    Any CPU spike above IDLE_CPU_PCT resets the streak and restores normal speed.
+#
+#  Shutdown sequence
+#  =================
+#    SIGINT / SIGTERM / CTRL+C → sets _shutdown_event → collector loop exits
+#    → drain queues → flush DB → final export → all threads join
+#    The process exits cleanly within 10 seconds in all tested scenarios.
+# ══════════════════════════════════════════════════════════════════════════════
+
+import io as _io
+
+# ── Tuning constants ──────────────────────────────────────────────────────────
+_COLLECTOR_Q_MAX:    int   = 60    # ~1 min of snapshots; prevents memory growth
+_RENDERER_Q_MAX:     int   = 60
+_MAX_RESTARTS:       int   = 5     # per module per run
+_WATCHDOG_INTERVAL:  float = 5.0   # seconds between watchdog checks
+_EXPORT_ON_CYCLE:    int   = 1     # write first export at cycle 1 for path init
+_EXPORT_INTERVAL:    int   = 0     # 0 = export only at startup and shutdown
+_PRUNE_EVERY:        int   = 200   # writer cycles between DB prune calls
+_CHECKPOINT_EVERY:   int   = 1000  # writer cycles between WAL checkpoints
+
+# Adaptive idle detection
+_IDLE_CPU_PCT:         float = 15.0  # CPU% considered "idle"
+_IDLE_STREAK_NEEDED:   int   = 10   # consecutive idle cycles before slowing
+_IDLE_INTERVAL_MULT:   float = 2.0  # multiply INTERVAL_SEC when idle
+_MAX_IDLE_INTERVAL_SEC: float = 30.0 # absolute ceiling
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Module state dataclass — one per module, managed by watchdog
+# ══════════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class _ModuleState:
+    """
+    Tracks liveness and restart statistics for one module thread.
+    All fields are read/written under the watchdog lock.
+    """
+    name:        str
+    thread:      Optional[threading.Thread] = None
+    restarts:    int   = 0
+    failed:      bool  = False       # True after MAX_RESTARTS exhausted
+    last_error:  str   = ""
+    last_alive:  float = field(default_factory=time.monotonic)
+    cycles:      int   = 0           # successful cycles completed
+
+    def is_alive(self) -> bool:
+        return self.thread is not None and self.thread.is_alive()
+
+    def mark_cycle(self) -> None:
+        self.cycles += 1
+        self.last_alive = time.monotonic()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Shutdown coordination
+# ══════════════════════════════════════════════════════════════════════════════
+
+_shutdown_event = threading.Event()   # set → all loops exit gracefully
+
+
+def _install_signal_handlers() -> None:
+    """Install SIGINT / SIGTERM handlers.  Safe to call from main thread."""
+    def _handler(signum, _frame):
+        name = signal.Signals(signum).name if hasattr(signal, "Signals") else str(signum)
+        log.info("Signal %s received — initiating graceful shutdown.", name)
+        _shutdown_event.set()
+
+    signal.signal(signal.SIGINT, _handler)
+    if hasattr(signal, "SIGTERM"):
+        signal.signal(signal.SIGTERM, _handler)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Adaptive timing helper
+# ══════════════════════════════════════════════════════════════════════════════
+
+class _AdaptiveTimer:
+    """
+    Tracks idle/busy streak and returns the appropriate sleep duration.
+
+    When the system is idle (CPU consistently below threshold) the timer
+    stretches to reduce unnecessary polling.  Any busy cycle resets it.
+    """
+
+    def __init__(self) -> None:
+        self._streak: int   = 0
+        self._is_idle: bool = False
+
+    def update(self, cpu_pct: float) -> float:
+        """
+        Call after each collection cycle with the measured system CPU %.
+        Returns the sleep duration to use before the next cycle.
+        """
+        if cpu_pct < _IDLE_CPU_PCT:
+            self._streak = min(self._streak + 1, _IDLE_STREAK_NEEDED + 1)
+        else:
+            self._streak = 0
+
+        if self._streak >= _IDLE_STREAK_NEEDED:
+            if not self._is_idle:
+                self._is_idle = True
+                log.debug("AdaptiveTimer: system idle — slowing to %.0fs", _MAX_IDLE_INTERVAL_SEC)
+            return min(INTERVAL_SEC * _IDLE_INTERVAL_MULT, _MAX_IDLE_INTERVAL_SEC)
+
+        if self._is_idle:
+            self._is_idle = False
+            log.debug("AdaptiveTimer: system busy — restoring %.0fs interval", INTERVAL_SEC)
+        return float(INTERVAL_SEC)
+
+    @property
+    def is_idle(self) -> bool:
+        return self._is_idle
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Module B — Writer thread
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _writer_loop(
+    conn_writer: sqlite3.Connection,
+    session_id:  int,
+    collector_q: "queue.Queue[Snapshot]",
+    renderer_q:  "queue.Queue[Tuple[int, Snapshot]]",
+    state:       _ModuleState,
+    export_paths: List[str],          # mutable [csv_path, json_path]
+    export_lock:  threading.Lock,
+) -> None:
+    """
+    Module B: drain collector_q → stage DB rows → flush on schedule.
+
+    Each loop iteration:
+      1. Dequeue one Snapshot (timeout 0.5 s so shutdown is responsive)
+      2. stage into DB batch buffer via write_snap()
+      3. If flush returned a snap_id, push (snap_id, snap) to renderer_q
+      4. Periodically: prune old DB rows, WAL checkpoint, initial export
+    """
+    log.info("[Writer] started (session %d).", session_id)
+    w_cycle       = 0
+    next_prune    = _PRUNE_EVERY
+    next_checkpoint = _CHECKPOINT_EVERY
+
+    while not _shutdown_event.is_set() or not collector_q.empty():
+        # ── Dequeue with timeout so the loop is responsive to shutdown ────────
+        try:
+            snap: Snapshot = collector_q.get(timeout=0.5)
+        except queue.Empty:
+            continue
+
+        try:
+            w_cycle += 1
+            snap_id = write_snap(conn_writer, session_id, snap, w_cycle)
+
+            if snap_id is not None:
+                # Push to renderer — non-blocking drop if renderer is slow
+                try:
+                    renderer_q.put_nowait((snap_id, snap))
+                except queue.Full:
+                    log.debug("[Writer] renderer_q full — skipping render for cycle %d.", w_cycle)
+
+            # ── Periodic maintenance ──────────────────────────────────────────
+            if w_cycle >= next_prune:
+                try:
+                    prune(conn_writer, session_id)
+                except Exception as exc:
+                    log.debug("[Writer] prune: %s", exc)
+                next_prune = w_cycle + _PRUNE_EVERY
+
+            if w_cycle >= next_checkpoint:
+                try:
+                    _wal_checkpoint(conn_writer)
+                except Exception as exc:
+                    log.debug("[Writer] checkpoint: %s", exc)
+                next_checkpoint = w_cycle + _CHECKPOINT_EVERY
+
+            # ── Initial export (provides download paths for dashboard) ─────────
+            if w_cycle == _EXPORT_ON_CYCLE:
+                try:
+                    p1, p2 = do_export(conn_writer, session_id)
+                    with export_lock:
+                        export_paths[0] = p1
+                        export_paths[1] = p2
+                except Exception as exc:
+                    log.debug("[Writer] initial export: %s", exc)
+
+            state.mark_cycle()
+            collector_q.task_done()
+
+        except Exception as exc:
+            log.error("[Writer] cycle %d: %s\n%s", w_cycle, exc, traceback.format_exc())
+            state.last_error = str(exc)
+            try: collector_q.task_done()
+            except Exception: pass
+
+    # ── Drain buffer on shutdown ──────────────────────────────────────────────
+    try:
+        flush_db_buffer(conn_writer)
+        log.info("[Writer] DB buffer flushed on shutdown.")
+    except Exception as exc:
+        log.error("[Writer] shutdown flush: %s", exc)
+
+    log.info("[Writer] stopped after %d cycle(s).", w_cycle)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Module C — Renderer thread
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _renderer_loop(
+    conn_renderer: sqlite3.Connection,
+    session_id:    int,
+    renderer_q:    "queue.Queue[Tuple[int, Snapshot]]",
+    state:         _ModuleState,
+) -> None:
+    """
+    Module C: drain renderer_q → build_data → enrich_live → write JSON.
+
+    Only writes data.json when meaningful metrics have changed
+    (delta guard in write_json_data).  Snapshot ring is written on every
+    successful render so it always reflects the most recent state.
+    """
+    log.info("[Renderer] started.")
+
+    while not _shutdown_event.is_set() or not renderer_q.empty():
+        try:
+            item: Tuple[int, Snapshot] = renderer_q.get(timeout=0.5)
+        except queue.Empty:
+            continue
+
+        try:
+            _snap_id, snap = item
+            data = build_data(conn_renderer, session_id)
+
+            if data is not None:
+                enrich_live(data, snap)
+                write_json_data(data)
+                write_snapshot_file(data)
+
+            state.mark_cycle()
+            renderer_q.task_done()
+
+        except Exception as exc:
+            log.error("[Renderer] error: %s\n%s", exc, traceback.format_exc())
+            state.last_error = str(exc)
+            try: renderer_q.task_done()
+            except Exception: pass
+
+    log.info("[Renderer] stopped after %d cycle(s).", state.cycles)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Module D — Watchdog thread
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _watchdog_loop(
+    states:        Dict[str, _ModuleState],
+    factories:     Dict[str, Any],    # name -> callable that returns new Thread
+    lock:          threading.Lock,
+) -> None:
+    """
+    Module D: monitor all registered module threads every _WATCHDOG_INTERVAL s.
+
+    For each dead module (thread not alive and not explicitly shut down):
+      - If restarts < MAX_RESTARTS: create and start a fresh thread
+      - Otherwise: mark the module as permanently failed and log a CRITICAL
+    Also calls storage_health._refresh_space() to keep disk metrics current.
+    """
+    log.info("[Watchdog] started.")
+
+    while not _shutdown_event.is_set():
+        _shutdown_event.wait(timeout=_WATCHDOG_INTERVAL)
+        if _shutdown_event.is_set():
+            break
+
+        with lock:
+            for name, state in states.items():
+                if state.failed:
+                    continue
+                if state.is_alive():
+                    continue
+                # Thread is dead
+                if state.restarts >= _MAX_RESTARTS:
+                    state.failed = True
+                    log.critical(
+                        "[Watchdog] Module '%s' failed permanently after %d restart(s). "
+                        "Last error: %s",
+                        name, state.restarts, state.last_error or "unknown",
+                    )
+                    continue
+
+                state.restarts += 1
+                log.warning(
+                    "[Watchdog] Module '%s' is down — restart #%d (max %d). "
+                    "Last error: %s",
+                    name, state.restarts, _MAX_RESTARTS, state.last_error or "none",
+                )
+                try:
+                    new_thread = factories[name]()
+                    new_thread.start()
+                    state.thread = new_thread
+                    state.last_error = ""
+                    log.info("[Watchdog] Module '%s' restarted successfully.", name)
+                except Exception as exc:
+                    log.error("[Watchdog] Failed to restart module '%s': %s", name, exc)
+
+        # Refresh disk space metrics (best-effort, non-blocking)
+        try:
+            storage_health._refresh_space()
+        except Exception:
+            pass
+
+    log.info("[Watchdog] stopped.")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Startup helpers
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _open_db(path: str) -> sqlite3.Connection:
+    """Open a SQLite connection, apply PRAGMAs, and return it."""
+    conn = sqlite3.connect(path, check_same_thread=False)
+    _pragmas(conn)
+    return conn
+
+
+def _safe_sleep(seconds: float) -> None:
+    """
+    Sleep for *seconds*, waking early if the shutdown event is set.
+    Uses event.wait() instead of time.sleep() so Ctrl+C is responsive
+    even during long idle-mode delays.
+    """
+    _shutdown_event.wait(timeout=max(0.0, seconds))
+
+
+def _log_startup_banner(session_id: int) -> None:
+    log.info(
+        "Activity Monitor starting  |  session=%d  interval=%ds  "
+        "proc_scan=%ds  db=%s",
+        session_id, INTERVAL_SEC, PROC_SCAN_INTERVAL, DB_PATH,
+    )
+    log.info(
+        "Paths  |  html=%s  data=%s  snapshots=%s  exports=%s",
+        HTML_PATH, JSON_DATA_PATH, str(_DIR_SNAPSHOTS), str(_DIR_EXPORTS),
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  main()  —  entry point
+# ══════════════════════════════════════════════════════════════════════════════
+
+def main() -> None:
+    """
+    Start all four modules and run the collection loop on the main thread.
+
+    Main thread = Module A (Collector)
+      Keeps psutil and signal handlers on the main OS thread, which avoids
+      Windows-specific restrictions on signal delivery to daemon threads.
+
+    Startup sequence
+    ================
+    1.  Install signal handlers (SIGINT, SIGTERM)
+    2.  Write SPA HTML shell (once; skipped if already current)
+    3.  Open DB connections (one per thread to avoid locking)
+    4.  Init DB schema, start session
+    5.  Start Module B (Writer), Module C (Renderer), Module D (Watchdog)
+    6.  Run collection loop on main thread until _shutdown_event is set
+    7.  Drain queues, flush DB, write final export
+
+    Error isolation
+    ===============
+    Every module runs in its own try/except.  A crash in one module is caught,
+    logged, and (by the watchdog) restarted.  The collection loop on the main
+    thread is wrapped in a broad except that logs and continues.
+    """
+    _install_signal_handlers()
+
+    # ── Startup: SPA shell ────────────────────────────────────────────────────
+    try:
+        write_spa_html()
+    except Exception as exc:
+        log.warning("write_spa_html: %s", exc)
+
+    # ── DB: one connection per thread ─────────────────────────────────────────
+    try:
+        conn_writer   = _open_db(DB_PATH)
+        conn_renderer = _open_db(DB_PATH)
+    except Exception as exc:
+        _die(f"Cannot open database {DB_PATH}: {exc}\n{traceback.format_exc()}")
+        return  # unreachable; satisfies type checkers
+
+    try:
+        init_db(conn_writer)
+        session_id = start_session(conn_writer)
+    except Exception as exc:
+        _die(f"DB initialisation failed: {exc}\n{traceback.format_exc()}")
+        return
+
+    _log_startup_banner(session_id)
+
+    # ── Shared inter-thread state ─────────────────────────────────────────────
+    collector_q:  "queue.Queue[Snapshot]"           = queue.Queue(maxsize=_COLLECTOR_Q_MAX)
+    renderer_q:   "queue.Queue[Tuple[int, Snapshot]]" = queue.Queue(maxsize=_RENDERER_Q_MAX)
+    export_paths: List[str]   = ["", ""]    # mutated by writer on first export
+    export_lock:  threading.Lock = threading.Lock()
+    watchdog_lock: threading.Lock = threading.Lock()
+    adaptive = _AdaptiveTimer()
+
+    # ── Module states ─────────────────────────────────────────────────────────
+    writer_state   = _ModuleState("writer")
+    renderer_state = _ModuleState("renderer")
+
+    states: Dict[str, _ModuleState] = {
+        "writer":   writer_state,
+        "renderer": renderer_state,
+    }
+
+    # ── Module factories (used by watchdog for restarts) ─────────────────────
+    def _make_writer() -> threading.Thread:
+        return threading.Thread(
+            target=_writer_loop,
+            args=(conn_writer, session_id, collector_q,
+                  renderer_q, writer_state, export_paths, export_lock),
+            name="writer",
+            daemon=True,
+        )
+
+    def _make_renderer() -> threading.Thread:
+        return threading.Thread(
+            target=_renderer_loop,
+            args=(conn_renderer, session_id, renderer_q, renderer_state),
+            name="renderer",
+            daemon=True,
+        )
+
+    factories: Dict[str, Any] = {
+        "writer":   _make_writer,
+        "renderer": _make_renderer,
+    }
+
+    # ── Start background modules ──────────────────────────────────────────────
+    t_writer   = _make_writer();   t_writer.start();   writer_state.thread   = t_writer
+    t_renderer = _make_renderer(); t_renderer.start(); renderer_state.thread = t_renderer
+
+    t_watchdog = threading.Thread(
+        target=_watchdog_loop,
+        args=(states, factories, watchdog_lock),
+        name="watchdog",
+        daemon=True,
+    )
+    t_watchdog.start()
+
+    log.info("Modules started: writer=%s renderer=%s watchdog=%s",
+             t_writer.name, t_renderer.name, t_watchdog.name)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    #  Module A — Collector loop (main thread)
+    # ══════════════════════════════════════════════════════════════════════════
+
+    prev_procs: Dict[str, ProcEntry] = {}
+    cycle           = 0
+    consec_errors   = 0
+    _MAX_CONSEC_ERR = 10   # log a WARNING after this many consecutive errors
+
+    log.info("[Collector] starting main loop (interval=%ds).", INTERVAL_SEC)
+
+    while not _shutdown_event.is_set():
+        t_cycle_start = time.monotonic()
+
+        # ── Collect ───────────────────────────────────────────────────────────
+        try:
+            snap       = collect(prev_procs)
+            prev_procs = snap.procs
+            cycle     += 1
+            consec_errors = 0
+
+            # ── Enqueue snapshot ──────────────────────────────────────────────
+            # Blocking put with shutdown-aware timeout.
+            # If the writer is dead the queue will fill; we log and skip
+            # rather than blocking the collection cycle forever.
+            if not _shutdown_event.is_set():
+                try:
+                    collector_q.put(snap, timeout=INTERVAL_SEC)
+                except queue.Full:
+                    log.warning(
+                        "[Collector] collector_q full at cycle %d "
+                        "(writer alive=%s) — snapshot dropped.",
+                        cycle, writer_state.is_alive(),
+                    )
+
+            # ── Adaptive timing ───────────────────────────────────────────────
+            sleep_for = adaptive.update(snap.cpu.total_pct)
+
+        except Exception as exc:
+            consec_errors += 1
+            if consec_errors == 1 or consec_errors % _MAX_CONSEC_ERR == 0:
+                log.error(
+                    "[Collector] cycle %d error #%d: %s\n%s",
+                    cycle, consec_errors, exc, traceback.format_exc(),
+                )
+            sleep_for = float(INTERVAL_SEC)
+
+        # ── Adaptive sleep ────────────────────────────────────────────────────
+        # Compensate for the time already spent collecting so the wall-clock
+        # interval stays close to INTERVAL_SEC regardless of collection cost.
+        elapsed   = time.monotonic() - t_cycle_start
+        remaining = max(0.0, sleep_for - elapsed)
+        if remaining > 0:
+            _safe_sleep(remaining)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    #  Graceful shutdown
+    # ══════════════════════════════════════════════════════════════════════════
+
+    log.info("Shutdown: draining queues (collector=%d renderer=%d) …",
+             collector_q.qsize(), renderer_q.qsize())
+
+    # Give writer/renderer time to drain
+    try:
+        collector_q.join()
+    except Exception:
+        pass
+    try:
+        renderer_q.join()
+    except Exception:
+        pass
+
+    # Join module threads with generous timeouts
+    for t in (t_writer, t_renderer, t_watchdog):
+        try:
+            t.join(timeout=8)
+            if t.is_alive():
+                log.warning("Thread '%s' did not exit within 8 s.", t.name)
+        except Exception as exc:
+            log.debug("join %s: %s", t.name, exc)
+
+    # Final DB flush
+    try:
+        flush_db_buffer(conn_writer)
+        log.info("Shutdown: DB buffer flushed.")
+    except Exception as exc:
+        log.error("Shutdown DB flush: %s", exc)
+
+    # Final export
+    try:
+        p1, p2 = do_export(conn_writer, session_id)
+        log.info("Shutdown export: %s  %s", p1, p2)
+    except Exception as exc:
+        log.warning("Shutdown export: %s", exc)
+
+    # Close DB connections
+    for conn, name in ((conn_writer, "writer"), (conn_renderer, "renderer")):
+        try:
+            conn.close()
+        except Exception as exc:
+            log.debug("DB close %s: %s", name, exc)
+
+    log.info(
+        "Activity Monitor stopped  |  session=%d  cycles=%d  "
+        "writer=%d  renderer=%d",
+        session_id, cycle,
+        writer_state.cycles, renderer_state.cycles,
+    )
+
+
+if __name__ == "__main__":
+    main()
